@@ -151,7 +151,17 @@ impl InstanceInfo {
 				["Subscriptions", &convert(&self.config.default_subscriptions)],
 				["Filters", &convert(&self.config.default_filters)],
 			])
-			.with_header_row(["Default preferences"]),
+			.with_header_row(["Default preferences"])
+			.with_attributes([("id", "instanceDefaultPreferencesTable")]),
+		);
+		container.add_raw(
+			r#"
+<style>
+#instanceDefaultPreferencesTable td:nth-of-type(2){
+	overflow-wrap:anywhere;
+}
+</style>
+	"#,
 		);
 		container.to_html_string().replace("<th>", "<th colspan=\"2\">")
 	}
