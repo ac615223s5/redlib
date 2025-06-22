@@ -708,8 +708,8 @@ impl Preferences {
 		}
 		Self {
 			available_themes: themes,
-			theme_light: setting(req, "theme_light"),
-			theme_dark: setting(req, "theme_dark"),
+			theme_light: setting_or_default(req, "theme_light", "light".to_string()),
+			theme_dark: setting_or_default(req, "theme_dark", "dark".to_string()),
 			front_page: setting(req, "front_page"),
 			layout: setting(req, "layout"),
 			wide: setting(req, "wide"),
