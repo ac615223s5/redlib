@@ -233,8 +233,8 @@ async fn main() {
 		.at("/highlighted.js")
 		.get(|_| resource(include_str!("../static/highlighted.js"), "text/javascript", false).boxed());
 	app
-	.at("/commentcollapse.js")
-	.get(|_| resource(include_str!("../static/commentcollapse.js"), "text/javascript", false).boxed());
+		.at("/commentcollapse.js")
+		.get(|_| resource(include_str!("../static/commentcollapse.js"), "text/javascript", false).boxed());
 
 	// Proxy media through Redlib
 	app.at("/vid/:id/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
