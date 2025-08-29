@@ -456,7 +456,7 @@ pub async fn proxy_commit_info() -> Result<Response<Body>, String> {
 
 #[cached(time = 600)]
 async fn fetch_commit_info() -> String {
-	let uri = Uri::from_str("https://github.com/redlib-org/redlib/commits/main.atom").expect("Invalid URI");
+	let uri = Uri::from_str("https://github.com/ac615223s5/redlib/commits/main.atom").expect("Invalid URI");
 
 	let resp: Body = CLIENT.get(uri).await.expect("Failed to request GitHub").into_body();
 
