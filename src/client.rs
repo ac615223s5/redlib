@@ -156,7 +156,7 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 	// Build the hyper client from the HTTPS connector.
 	let client: &Lazy<Client<_, Body>> = &CLIENT;
 
-	let mut builder = Request::get(parsed_uri);
+	let mut builder = Request::get(parsed_uri).header("User-Agent", OAUTH_CLIENT.load_full().headers_map.get("User-Agent").expect("User-Agent expected"));
 
 	// Copy useful headers from original request
 	for &key in &["Range", "If-Modified-Since", "Cache-Control"] {
