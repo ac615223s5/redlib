@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
 use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use askama::Template;
 use cookie::Cookie;
 use futures_lite::StreamExt;
 use hyper::{Body, Request, Response};
-use rinja::Template;
 use time::{Duration, OffsetDateTime};
 use tokio::time::timeout;
 use url::form_urlencoded;
@@ -49,7 +49,7 @@ const PREFS: [&str; 20] = [
 
 // FUNCTIONS
 
-// Retrieve cookies from request "Cookie" header
+/// Retrieve cookies from request "Cookie" header
 pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = req.uri().to_string();
 	Ok(template(&SettingsTemplate {
@@ -58,7 +58,7 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	}))
 }
 
-// Set cookies using response "Set-Cookie" header
+/// Set cookies using response "Set-Cookie" header
 pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Split the body into parts
 	let (parts, mut body) = req.into_parts();
@@ -160,8 +160,8 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 		.unwrap_or_else(String::new); // Return an empty string if None
 
 	// If there are subscriptions to restore set them and delete any old subscriptions cookies, otherwise delete them all
-	if subscriptions.is_some() {
-		let sub_list: Vec<String> = subscriptions.expect("Subscriptions").split('+').map(str::to_string).collect();
+	if let Some(subscriptions) = subscriptions {
+		let sub_list: Vec<String> = subscriptions.split('+').map(str::to_string).collect();
 
 		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
 		let mut subscriptions_number_to_delete_from = 0;
@@ -211,8 +211,8 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	}
 
 	// If there are filters to restore set them and delete any old filters cookies, otherwise delete them all
-	if filters.is_some() {
-		let filters_list: Vec<String> = filters.expect("Filters").split('+').map(str::to_string).collect();
+	if let Some(filters) = filters {
+		let filters_list: Vec<String> = filters.split('+').map(str::to_string).collect();
 
 		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
 		let mut filters_number_to_delete_from = 0;
@@ -264,7 +264,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	response
 }
 
-// Set cookies using response "Set-Cookie" header
+/// Set cookies using response "Set-Cookie" header
 pub async fn restore(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(set_cookies_method(req, true))
 }
