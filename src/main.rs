@@ -298,6 +298,9 @@ async fn main() {
 	app
 		.at("/downloadCombinedVideo.js")
 		.get(|_| resource(include_str!("../static/downloadCombinedVideo.js"), "text/javascript", false).boxed());
+	app
+		.at("/downloadGallery.js")
+		.get(|_| resource(include_str!("../static/downloadGallery.js"), "text/javascript", false).boxed());
 
 
 	app.at("/static/ffmpeg/ffmpeg.min.js")
