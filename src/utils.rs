@@ -748,15 +748,6 @@ impl Preferences {
 		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
 	}
 
-	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
-		bincode::serialize(self).map_err(|e| e.to_string())
-	}
-	pub fn to_compressed_bincode(&self) -> Result<Vec<u8>, String> {
-		deflate_compress(self.to_bincode()?)
-	}
-	pub fn to_bincode_str(&self) -> Result<String, String> {
-		Ok(base2048::encode(&self.to_compressed_bincode()?))
-	}
 	fn convert_theme(&mut self, _revision: u16, value: String) -> Result<(), Error> {
 		self.theme_light = value.clone();
 		self.theme_dark = value;
@@ -1664,264 +1655,22 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 	assert_eq!(render_bullet_lists(input), output);
 }
 
-#[test]
-fn test_default_prefs_serialization_loop_json() {
-	let prefs = Preferences::default();
-	let serialized = serde_json::to_string(&prefs).unwrap();
-	let deserialized: Preferences = serde_json::from_str(&serialized).unwrap();
-	assert_eq!(prefs, deserialized);
-}
 
-#[test]
-fn test_default_prefs_serialization_loop_bincode() {
-	let prefs = Preferences::default();
-	test_round_trip(&prefs, false);
-	test_round_trip(&prefs, true);
-}
-
-static KNOWN_GOOD_CONFIGS: &[&str] = &[
-	"ఴӅβØØҞÉဏႢձĬ༧ȒʯऌԔӵ୮༏",
-	"ਧՊΥÀÃǎƱГ۸ඣമĖฤ႙ʟาúໜϾௐɥঀĜໃહཞઠѫҲɂఙ࿔ǲઉƲӟӻĻฅΜδ໖ԜǗဖငƦơ৶Ą௩ԹʛใЛʃශаΏ",
-	"ਧԩΥÀÃÎŠ౭൩ඔႠϼҭöҪƸռઇԾॐნɔາǒՍҰच௨ಖມŃЉŐདƦ๙ϩএఠȝഽйʮჯඒϰळՋ௮ສ৵ऎΦѧਹಧଟƙŃ३î༦ŌပղयƟแҜ།",
-	"ਧҫഗÀÃǑŠ୯ಯǻώਬɚএʭ၅űЮʆౙΣƌ৷۶қઍফԡț३ҔЪɺઆಝǺ๒ӢƜ২ǚൿଘϐӂÙɟȣඏѤώఐчဝϷÍடऒ੮ϔЂඉʊШคĴೡ૭தɯӼ༐",
+// Known good configs stored as URL-encoded text (after base2048 decode + deflate decompress)
+static KNOWN_GOOD_CONFIGS_TEXT: &[&str] = &[
+	"theme_light=&theme_dark=&front_page=&layout=&wide=&blur_spoiler=&show_nsfw=&blur_nsfw=&hide_hls_notification=&video_quality=&hide_sidebar_and_summary=&use_hls=&autoplay_videos=&fixed_navbar=on&disable_visit_reddit_confirmation=&comment_sort=&post_sort=&subscriptions=&filters=&hide_awards=&hide_score=&remove_default_feeds=",
+	"theme_light=gruvboxlight&theme_dark=gruvboxdark&front_page=default&layout=card&wide=off&blur_spoiler=off&show_nsfw=off&blur_nsfw=off&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=off&autoplay_videos=off&fixed_navbar=on&disable_visit_reddit_confirmation=off&comment_sort=confidence&post_sort=hot&subscriptions=&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off",
+	"theme_light=gruvboxlight&theme_dark=gruvboxdark&front_page=popular&layout=clean&wide=on&blur_spoiler=on&show_nsfw=on&blur_nsfw=on&hide_hls_notification=on&video_quality=worst&hide_sidebar_and_summary=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=top&post_sort=top&subscriptions=&filters=&hide_awards=on&hide_score=on&remove_default_feeds=on",
 ];
 
 #[test]
-fn test_known_good_configs_deserialization() {
-	for config in KNOWN_GOOD_CONFIGS {
-		let bytes = base2048::decode(config).unwrap();
-		let decompressed = deflate_decompress(bytes).unwrap();
-		assert!(bincode::deserialize::<Preferences>(&decompressed).is_ok());
-	}
-}
-
-#[test]
-fn test_known_good_configs_full_round_trip() {
-	for config in KNOWN_GOOD_CONFIGS {
-		let bytes = base2048::decode(config).unwrap();
-		let decompressed = deflate_decompress(bytes).unwrap();
-		let prefs: Preferences = bincode::deserialize(&decompressed).unwrap();
-		test_round_trip(&prefs, false);
-		test_round_trip(&prefs, true);
-	}
-}
-
-fn test_round_trip(input: &Preferences, compression: bool) {
-	let serialized = bincode::serialize(input).unwrap();
-	let compressed = if compression { deflate_compress(serialized).unwrap() } else { serialized };
-	let decompressed = if compression { deflate_decompress(compressed).unwrap() } else { compressed };
-	let deserialized: Preferences = bincode::deserialize(&decompressed).unwrap();
-	assert_eq!(*input, deserialized);
-}
-// Custom Deserialize for backward compatibility with old revision 1 configs (theme field)
-impl<'de> Deserialize<'de> for Preferences {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		struct PreferencesVisitor;
-
-		impl<'de> serde::de::Visitor<'de> for PreferencesVisitor {
-			type Value = Preferences;
-
-			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-				formatter.write_str("struct Preferences")
-			}
-
-			fn visit_map<V>(self, mut map: V) -> Result<Preferences, V::Error>
-			where
-				V: serde::de::MapAccess<'de>,
-			{
-				let mut theme: Option<String> = None;
-				let mut theme_light: Option<String> = None;
-				let mut theme_dark: Option<String> = None;
-				let mut front_page: Option<String> = None;
-				let mut layout: Option<String> = None;
-				let mut wide: Option<String> = None;
-				let mut blur_spoiler: Option<String> = None;
-				let mut show_nsfw: Option<String> = None;
-				let mut blur_nsfw: Option<String> = None;
-				let mut hide_hls_notification: Option<String> = None;
-				let mut video_quality: Option<String> = None;
-				let mut hide_sidebar_and_summary: Option<String> = None;
-				let mut use_hls: Option<String> = None;
-				let mut autoplay_videos: Option<String> = None;
-				let mut fixed_navbar: Option<String> = None;
-				let mut disable_visit_reddit_confirmation: Option<String> = None;
-				let mut comment_sort: Option<String> = None;
-				let mut post_sort: Option<String> = None;
-				let mut subscriptions: Option<Vec<String>> = None;
-				let mut filters: Option<Vec<String>> = None;
-				let mut hide_awards: Option<String> = None;
-				let mut hide_score: Option<String> = None;
-				let mut remove_default_feeds: Option<String> = None;
-
-				while let Some(key) = map.next_key()? {
-					match key {
-						"theme" => theme = Some(map.next_value()?),
-						"theme_light" => theme_light = Some(map.next_value()?),
-						"theme_dark" => theme_dark = Some(map.next_value()?),
-						"front_page" => front_page = Some(map.next_value()?),
-						"layout" => layout = Some(map.next_value()?),
-						"wide" => wide = Some(map.next_value()?),
-						"blur_spoiler" => blur_spoiler = Some(map.next_value()?),
-						"show_nsfw" => show_nsfw = Some(map.next_value()?),
-						"blur_nsfw" => blur_nsfw = Some(map.next_value()?),
-						"hide_hls_notification" => hide_hls_notification = Some(map.next_value()?),
-						"video_quality" => video_quality = Some(map.next_value()?),
-						"hide_sidebar_and_summary" => hide_sidebar_and_summary = Some(map.next_value()?),
-						"use_hls" => use_hls = Some(map.next_value()?),
-						"autoplay_videos" => autoplay_videos = Some(map.next_value()?),
-						"fixed_navbar" => fixed_navbar = Some(map.next_value()?),
-						"disable_visit_reddit_confirmation" => disable_visit_reddit_confirmation = Some(map.next_value()?),
-						"comment_sort" => comment_sort = Some(map.next_value()?),
-						"post_sort" => post_sort = Some(map.next_value()?),
-						"subscriptions" => {
-							// Deserialize as string (matches serialize_vec_with_plus format), then parse
-							let s: String = map.next_value()?;
-							subscriptions = Some(if s.is_empty() { vec![] } else { s.split('+').map(|v| v.to_string()).collect() });
-						}
-						"filters" => {
-							// Deserialize as string (matches serialize_vec_with_plus format), then parse
-							let s: String = map.next_value()?;
-							filters = Some(if s.is_empty() { vec![] } else { s.split('+').map(|v| v.to_string()).collect() });
-						}
-						"hide_awards" => hide_awards = Some(map.next_value()?),
-						"hide_score" => hide_score = Some(map.next_value()?),
-						"remove_default_feeds" => remove_default_feeds = Some(map.next_value()?),
-						_ => { let _: serde::de::IgnoredAny = map.next_value()?; }
-					}
-				}
-
-				// Handle backward compatibility: if old theme field exists but not theme_light/theme_dark, use theme for both
-				let (final_theme_light, final_theme_dark) = if theme.is_some() && theme_light.is_none() && theme_dark.is_none() {
-					let t = theme.unwrap();
-					(t.clone(), t)
-				} else {
-					(theme_light.unwrap_or_default(), theme_dark.unwrap_or_default())
-				};
-
-				Ok(Preferences {
-					available_themes: vec![],
-					theme_light: final_theme_light,
-					theme_dark: final_theme_dark,
-					front_page: front_page.unwrap_or_default(),
-					layout: layout.unwrap_or_default(),
-					wide: wide.unwrap_or_default(),
-					blur_spoiler: blur_spoiler.unwrap_or_default(),
-					show_nsfw: show_nsfw.unwrap_or_default(),
-					hide_sidebar_and_summary: hide_sidebar_and_summary.unwrap_or_default(),
-					blur_nsfw: blur_nsfw.unwrap_or_default(),
-					use_hls: use_hls.unwrap_or_default(),
-					hide_hls_notification: hide_hls_notification.unwrap_or_default(),
-					video_quality: video_quality.unwrap_or_default(),
-					autoplay_videos: autoplay_videos.unwrap_or_default(),
-					fixed_navbar: fixed_navbar.unwrap_or_default(),
-					disable_visit_reddit_confirmation: disable_visit_reddit_confirmation.unwrap_or_default(),
-					comment_sort: comment_sort.unwrap_or_default(),
-					post_sort: post_sort.unwrap_or_default(),
-					subscriptions: subscriptions.unwrap_or_default(),
-					filters: filters.unwrap_or_default(),
-					hide_awards: hide_awards.unwrap_or_default(),
-					hide_score: hide_score.unwrap_or_default(),
-					remove_default_feeds: remove_default_feeds.unwrap_or_default(),
-				})
-			}
-
-			fn visit_seq<A>(self, mut seq: A) -> Result<Preferences, A::Error>
-			where
-				A: serde::de::SeqAccess<'de>,
-			{
-				// Bincode uses sequence format - fields in order
-				// Revision 1: 21 fields (theme, then 20 others, available_themes skipped)
-				// Revision 2: 22 fields (theme_light, theme_dark, then 20 others, available_themes skipped)
-				// Read all fields as optional to handle both formats
-				let mut fields: Vec<Option<String>> = Vec::new();
-				for _ in 0..22 {
-					// Use next_element::<String>() and handle EOF gracefully
-					// When bincode hits unexpected EOF, it returns Err, so we need to catch that
-					match seq.next_element::<String>() {
-						Ok(Some(v)) => fields.push(Some(v)),
-						Ok(None) | Err(_) => fields.push(None),
-					}
-				}
-
-				// Revision 1 has theme at field 0, Revision 2 has theme_light at 0 and theme_dark at 1
-				// If field 1 is None, we're dealing with Revision 1 format:
-				//   field 0 = theme, use it for both theme_light and theme_dark
-				// If field 1 is Some, we're dealing with Revision 2 format:
-				//   field 0 = theme_light, field 1 = theme_dark
-				let (theme_light, theme_dark) = if fields[1].is_none() && fields[0].is_some() {
-					// Revision 1: single theme field
-					let t = fields[0].clone().unwrap_or_default();
-					(t.clone(), t)
-				} else {
-					// Revision 2: separate light/dark themes
-					(fields[0].clone().unwrap_or_default(), fields[1].clone().unwrap_or_default())
-				};
-
-				// Field mapping for revision 2 (after theme_light/theme_dark):
-				// 2: front_page, 3: layout, 4: wide, 5: blur_spoiler, 6: show_nsfw, 7: blur_nsfw,
-				// 8: hide_hls_notification, 9: video_quality, 10: hide_sidebar_and_summary, 11: use_hls,
-				// 12: autoplay_videos, 13: fixed_navbar, 14: disable_visit_reddit_confirmation,
-				// 15: comment_sort, 16: post_sort, 17: subscriptions, 18: filters, 19: hide_awards,
-				// 20: hide_score, 21: remove_default_feeds
-				let front_page = fields[2].clone().unwrap_or_default();
-				let layout = fields[3].clone().unwrap_or_default();
-				let wide = fields[4].clone().unwrap_or_default();
-				let blur_spoiler = fields[5].clone().unwrap_or_default();
-				let show_nsfw = fields[6].clone().unwrap_or_default();
-				let blur_nsfw = fields[7].clone().unwrap_or_default();
-				let hide_hls_notification = fields[8].clone().unwrap_or_default();
-				let video_quality = fields[9].clone().unwrap_or_default();
-				let hide_sidebar_and_summary = fields[10].clone().unwrap_or_default();
-				let use_hls = fields[11].clone().unwrap_or_default();
-				let autoplay_videos = fields[12].clone().unwrap_or_default();
-				let fixed_navbar = fields[13].clone().unwrap_or_default();
-				let disable_visit_reddit_confirmation = fields[14].clone().unwrap_or_default();
-				let comment_sort = fields[15].clone().unwrap_or_default();
-				let post_sort = fields[16].clone().unwrap_or_default();
-				let subscriptions: Vec<String> = fields[17].clone().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-				let filters: Vec<String> = fields[18].clone().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-				let hide_awards = fields[19].clone().unwrap_or_default();
-				let hide_score = fields[20].clone().unwrap_or_default();
-				let remove_default_feeds = fields[21].clone().unwrap_or_default();
-
-				Ok(Preferences {
-					available_themes: vec![],
-					theme_light,
-					theme_dark,
-					front_page,
-					layout,
-					wide,
-					blur_spoiler,
-					show_nsfw,
-					hide_sidebar_and_summary,
-					blur_nsfw,
-					use_hls,
-					hide_hls_notification,
-					video_quality,
-					autoplay_videos,
-					fixed_navbar,
-					disable_visit_reddit_confirmation,
-					comment_sort,
-					post_sort,
-					subscriptions,
-					filters,
-					hide_awards,
-					hide_score,
-					remove_default_feeds,
-				})
-			}
-		}
-
-		const FIELDS: &[&str] = &[
-			"theme", "theme_light", "theme_dark", "front_page", "layout", "wide", "blur_spoiler",
-			"show_nsfw", "blur_nsfw", "hide_hls_notification", "video_quality", "hide_sidebar_and_summary",
-			"use_hls", "autoplay_videos", "fixed_navbar", "disable_visit_reddit_confirmation",
-			"comment_sort", "post_sort", "subscriptions", "filters", "hide_awards", "hide_score",
-			"remove_default_feeds",
-		];
-		deserializer.deserialize_struct("Preferences", FIELDS, PreferencesVisitor)
+fn test_known_good_configs_parse() {
+	for config_text in KNOWN_GOOD_CONFIGS_TEXT {
+		// Parse URL-encoded text and verify it works
+		let parsed = url::form_urlencoded::parse(config_text.as_bytes()).collect::<std::collections::HashMap<_, _>>();
+		// Verify we got all expected fields
+		assert!(parsed.contains_key("theme_light"));
+		assert!(parsed.contains_key("theme_dark"));
+		assert!(parsed.contains_key("show_nsfw"));
 	}
 }

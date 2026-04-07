@@ -1,5 +1,5 @@
 async function copy() {
-    await navigator.clipboard.writeText(document.getElementById('bincode_str').value);
+    await navigator.clipboard.writeText(document.getElementById('prefs_str').value);
 }
 
 async function set_listener() {
