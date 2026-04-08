@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 // CRATES
+use base2048;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
 use crate::utils::{deflate_decompress, redirect, template, Preferences};
@@ -274,6 +275,9 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
+	// Get cookies string before consuming req
+	let cookies_string = req.headers().get("cookie").map(|hv| hv.to_str().unwrap_or("").to_string()).unwrap_or_default();
+
 	let body = hyper::body::to_bytes(req.into_body())
 		.await
 		.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
@@ -282,25 +286,83 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 		return Err("Request body too large".to_string());
 	}
 
-	let encoded_prefs = form_urlencoded::parse(&body)
-		.find(|(key, _)| key == "encoded_prefs")
-		.map(|(_, value)| value)
-		.ok_or_else(|| "encoded_prefs parameter not found in request body".to_string())?;
+	// Parse the form body
+	let form = form_urlencoded::parse(&body).collect::<HashMap<_, _>>();
 
-	let bytes = base2048::decode(&encoded_prefs).ok_or_else(|| "Failed to decode base2048 encoded preferences".to_string())?;
+	let mut response = redirect("/settings");
 
-	let out = timeout(std::time::Duration::from_secs(1), async { deflate_decompress(bytes) })
-		.await
-		.map_err(|e| format!("Failed to decompress bytes: {e}"))??;
+	// Get the encoded_prefs value (can be base2048+deflate or plain URL-encoded text)
+	if let Some(encoded_prefs) = form.get("encoded_prefs") {
+		// Detect format: base2048 uses Unicode chars, plain text uses ASCII with &=
+		// Try base2048 decode first for backward compatibility
+		let prefs_text = if let Some(bytes) = base2048::decode(encoded_prefs) {
+			// Successfully decoded base2048, now decompress deflate
+			String::from_utf8_lossy(&deflate_decompress(bytes)
+				.map_err(|e| format!("Failed to decompress preferences: {}", e))?).to_string()
+		} else {
+			// Not base2048, treat as plain URL-encoded text
+			encoded_prefs.to_string()
+		};
 
-	let mut prefs: Preferences = timeout(std::time::Duration::from_secs(1), async { bincode::deserialize(&out) })
-		.await
-		.map_err(|e| format!("Failed to deserialize preferences: {e}"))?
-		.map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
+		// Parse the URL-encoded text
+		let prefs = form_urlencoded::parse(prefs_text.as_bytes()).collect::<HashMap<_, _>>();
 
-	prefs.available_themes = vec![];
+		// Only process fields that are in PREFS array (ignore extra fields)
+		for &name in &PREFS {
+			match prefs.get(name) {
+				Some(value) => {
+					if value.is_empty() {
+						// Empty value = reset setting (remove cookie)
+						response.remove_cookie(name.to_string());
+					} else {
+						// Non-empty value = set cookie
+						response.insert_cookie(
+							Cookie::build((name.to_owned(), value.clone()))
+								.path("/")
+								.http_only(true)
+								.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
+								.into(),
+						);
+					}
+				}
+				// Missing fields are ignored (don't delete existing cookies)
+				None => {}
+			}
+		}
 
-	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
+		// Handle subscriptions and filters separately (they can have multiple numbered cookies)
+		for list_name in &["subscriptions", "filters"] {
+			if let Some(value) = prefs.get(*list_name) {
+				if value.is_empty() {
+					// Remove unnumbered cookie
+					response.remove_cookie(list_name.to_string());
+					// Remove numbered cookies
+					let mut number = 1;
+					while cookies_string.contains(&format!("{list_name}{number}=")) {
+						response.remove_cookie(format!("{list_name}{number}"));
+						number += 1;
+					}
+				} else {
+					// Split by + and create numbered cookies
+					let items: Vec<String> = value.split('+').map(str::to_string).collect();
+					for (i, chunk) in join_until_size_limit(&items).into_iter().enumerate() {
+						let cookie_name = if i == 0 {
+							list_name.to_string()
+						} else {
+							format!("{list_name}{i}")
+						};
+						response.insert_cookie(
+							Cookie::build((cookie_name, chunk))
+								.path("/")
+								.http_only(true)
+								.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
+								.into(),
+						);
+					}
+				}
+			}
+		}
+	}
 
-	Ok(redirect(&url))
+	Ok(response)
 }

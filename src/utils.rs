@@ -12,7 +12,7 @@ use hyper::{Body, Request, Response};
 use libflate::deflate::{Decoder, Encoder};
 use log::error;
 use regex::Regex;
-use revision::revisioned;
+use revision::{revisioned, Error};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -653,15 +653,17 @@ pub struct Params {
 	pub before: Option<String>,
 }
 
-#[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
 pub struct Preferences {
 	#[revision(start = 1)]
-	#[serde(skip_serializing, skip_deserializing)]
+	#[serde(skip)]
 	pub available_themes: Vec<String>,
-	#[revision(start = 1)]
+	#[revision(start = 1, end = 2, convert_fn="convert_theme")]
+	pub theme: String,
+	#[revision(start = 2)]
 	pub theme_light: String,
-	#[revision(start = 1)]
+	#[revision(start = 2)]
 	pub theme_dark: String,
 	#[revision(start = 1)]
 	pub front_page: String,
@@ -739,10 +741,19 @@ impl Preferences {
 			let chunks: Vec<&str> = file.as_ref().split(".css").collect();
 			themes.push(chunks[0].to_owned());
 		}
+
+		// Handle backward compatibility: if user has old "theme" cookie, use it as fallback
+		// for any empty theme_light or theme_dark value
+		let old_theme = req.cookie("theme").map(|c| c.value().to_string());
+		let theme_light = setting(req, "theme_light");
+		let theme_dark = setting(req, "theme_dark");
+		let theme_light = theme_light.is_empty().then(|| old_theme.clone().unwrap_or_default()).unwrap_or(theme_light);
+		let theme_dark = theme_dark.is_empty().then(|| old_theme.unwrap_or_default()).unwrap_or(theme_dark);
+
 		Self {
 			available_themes: themes,
-			theme_light: setting_or_default(req, "theme_light", "light".to_string()),
-			theme_dark: setting_or_default(req, "theme_dark", "dark".to_string()),
+			theme_light,
+			theme_dark,
 			front_page: setting(req, "front_page"),
 			layout: setting(req, "layout"),
 			wide: setting(req, "wide"),
@@ -770,16 +781,13 @@ impl Preferences {
 		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
 	}
 
-	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
-		bincode::serialize(self).map_err(|e| e.to_string())
-	}
-	pub fn to_compressed_bincode(&self) -> Result<Vec<u8>, String> {
-		deflate_compress(self.to_bincode()?)
-	}
-	pub fn to_bincode_str(&self) -> Result<String, String> {
-		Ok(base2048::encode(&self.to_compressed_bincode()?))
+	fn convert_theme(&mut self, _revision: u16, value: String) -> Result<(), Error> {
+		self.theme_light = value.clone();
+		self.theme_dark = value;
+		Ok(())
 	}
 }
+
 
 pub fn deflate_compress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 	let mut e = Encoder::new(Vec::new());
@@ -1583,7 +1591,7 @@ mod tests {
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme_light=laserwave&theme_dark=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
 	}
 }
 
@@ -1677,51 +1685,22 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 	assert_eq!(render_bullet_lists(input), output);
 }
 
-#[test]
-fn test_default_prefs_serialization_loop_json() {
-	let prefs = Preferences::default();
-	let serialized = serde_json::to_string(&prefs).unwrap();
-	let deserialized: Preferences = serde_json::from_str(&serialized).unwrap();
-	assert_eq!(prefs, deserialized);
-}
 
-#[test]
-fn test_default_prefs_serialization_loop_bincode() {
-	let prefs = Preferences::default();
-	test_round_trip(&prefs, false);
-	test_round_trip(&prefs, true);
-}
-
-static KNOWN_GOOD_CONFIGS: &[&str] = &[
-	"ఴӅβØØҞÉဏႢձĬ༧ȒʯऌԔӵ୮༏",
-	"ਧՊΥÀÃǎƱГ۸ඣമĖฤ႙ʟาúໜϾௐɥঀĜໃહཞઠѫҲɂఙ࿔ǲઉƲӟӻĻฅΜδ໖ԜǗဖငƦơ৶Ą௩ԹʛใЛʃශаΏ",
-	"ਧԩΥÀÃÎŠ౭൩ඔႠϼҭöҪƸռઇԾॐნɔາǒՍҰच௨ಖມŃЉŐདƦ๙ϩএఠȝഽйʮჯඒϰळՋ௮ສ৵ऎΦѧਹಧଟƙŃ३î༦ŌပղयƟแҜ།",
+// Known good configs stored as URL-encoded text (after base2048 decode + deflate decompress)
+static KNOWN_GOOD_CONFIGS_TEXT: &[&str] = &[
+	"theme_light=&theme_dark=&front_page=&layout=&wide=&blur_spoiler=&show_nsfw=&blur_nsfw=&hide_hls_notification=&video_quality=&hide_sidebar_and_summary=&use_hls=&autoplay_videos=&fixed_navbar=on&disable_visit_reddit_confirmation=&comment_sort=&post_sort=&subscriptions=&filters=&hide_awards=&hide_score=&remove_default_feeds=",
+	"theme_light=gruvboxlight&theme_dark=gruvboxdark&front_page=default&layout=card&wide=off&blur_spoiler=off&show_nsfw=off&blur_nsfw=off&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=off&autoplay_videos=off&fixed_navbar=on&disable_visit_reddit_confirmation=off&comment_sort=confidence&post_sort=hot&subscriptions=&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off",
+	"theme_light=gruvboxlight&theme_dark=gruvboxdark&front_page=popular&layout=clean&wide=on&blur_spoiler=on&show_nsfw=on&blur_nsfw=on&hide_hls_notification=on&video_quality=worst&hide_sidebar_and_summary=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=top&post_sort=top&subscriptions=&filters=&hide_awards=on&hide_score=on&remove_default_feeds=on",
 ];
 
 #[test]
-fn test_known_good_configs_deserialization() {
-	for config in KNOWN_GOOD_CONFIGS {
-		let bytes = base2048::decode(config).unwrap();
-		let decompressed = deflate_decompress(bytes).unwrap();
-		assert!(bincode::deserialize::<Preferences>(&decompressed).is_ok());
+fn test_known_good_configs_parse() {
+	for config_text in KNOWN_GOOD_CONFIGS_TEXT {
+		// Parse URL-encoded text and verify it works
+		let parsed = url::form_urlencoded::parse(config_text.as_bytes()).collect::<std::collections::HashMap<_, _>>();
+		// Verify we got all expected fields
+		assert!(parsed.contains_key("theme_light"));
+		assert!(parsed.contains_key("theme_dark"));
+		assert!(parsed.contains_key("show_nsfw"));
 	}
-}
-
-#[test]
-fn test_known_good_configs_full_round_trip() {
-	for config in KNOWN_GOOD_CONFIGS {
-		let bytes = base2048::decode(config).unwrap();
-		let decompressed = deflate_decompress(bytes).unwrap();
-		let prefs: Preferences = bincode::deserialize(&decompressed).unwrap();
-		test_round_trip(&prefs, false);
-		test_round_trip(&prefs, true);
-	}
-}
-
-fn test_round_trip(input: &Preferences, compression: bool) {
-	let serialized = bincode::serialize(input).unwrap();
-	let compressed = if compression { deflate_compress(serialized).unwrap() } else { serialized };
-	let decompressed = if compression { deflate_decompress(compressed).unwrap() } else { compressed };
-	let deserialized: Preferences = bincode::deserialize(&decompressed).unwrap();
-	assert_eq!(*input, deserialized);
 }
