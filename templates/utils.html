@@ -186,7 +186,7 @@
 			{% endif %}
 			{% call external_reddit_link(post.permalink) %}
 
-			{% if post.media.download_name != "" %}
+			{% if post.media.download_name != "" && post.post_type != "gallery" %}
 			<li>
 				<a href="{{ post.media.url }}" download="{{ post.media.download_name }}">
 					<span class="mobile_item">dl</span>
