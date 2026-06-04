@@ -186,7 +186,7 @@
 			{% endif %}
 			{% call external_reddit_link(post.permalink) %}
 
-			{% if post.media.download_name != "" %}
+			{% if post.media.download_name != "" && post.post_type != "gallery" %}
 			{% if post.media.url_audio != "" %}
 			<!-- Combined video + audio download (JS) / Video only fallback (no JS) -->
 			<li>
