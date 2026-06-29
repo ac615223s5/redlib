@@ -88,16 +88,20 @@ async fn resource(body: &str, content_type: &str, cache: bool) -> Result<Respons
 
 	Ok(res)
 }
-fn resource_bytes(content: &'static [u8], mime: &'static str, _shared: bool) -> Response<Body> {
-    Response::builder()
+fn resource_bytes(content: &'static [u8], mime: &'static str, cache: bool) -> Response<Body> {
+    let mut builder = Response::builder()
         .header("Content-Type", mime)
         // Ensure these match your existing 'resource' function's security headers
         .header("Content-Security-Policy", "default-src 'none'; font-src 'self'; script-src 'self' blob: 'wasm-unsafe-eval'; manifest-src 'self'; media-src 'self' data: blob: about:; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; connect-src 'self'; worker-src 'self' blob:;")
         .header("Cross-Origin-Embedder-Policy", "require-corp")
         .header("Cross-Origin-Opener-Policy", "same-origin")
-        .status(200)
-        .body(Body::from(content))
-        .unwrap()
+        .status(200);
+
+    if cache {
+        builder = builder.header("Cache-Control", "public, max-age=1209600, s-maxage=86400");
+    }
+
+    builder.body(Body::from(content)).unwrap()
 }
 
 async fn style() -> Result<Response<Body>, String> {
@@ -302,18 +306,18 @@ async fn main() {
 
 
 	app.at("/static/ffmpeg/ffmpeg.min.js")
-		.get(|_| resource(include_str!("../static/ffmpeg/ffmpeg.min.js"), "text/javascript", false).boxed());
+		.get(|_| resource(include_str!("../static/ffmpeg/ffmpeg.min.js"), "text/javascript", true).boxed());
 	app.at("/static/ffmpeg/ffmpeg-util.min.js")
-		.get(|_| resource(include_str!("../static/ffmpeg/ffmpeg-util.min.js"), "text/javascript", false).boxed());
+		.get(|_| resource(include_str!("../static/ffmpeg/ffmpeg-util.min.js"), "text/javascript", true).boxed());
 	app.at("/static/ffmpeg/ffmpeg-core.js")
-		.get(|_| resource(include_str!("../static/ffmpeg/ffmpeg-core.js"), "text/javascript", false).boxed());
+		.get(|_| resource(include_str!("../static/ffmpeg/ffmpeg-core.js"), "text/javascript", true).boxed());
 	app.at("/static/ffmpeg/ffmpeg-core.wasm")
-		.get(|_| async { 
+		.get(|_| async {
 			// Wrap the response in Ok()
-			Ok(resource_bytes(include_bytes!("../static/ffmpeg/ffmpeg-core.wasm"), "application/wasm", false))
+			Ok(resource_bytes(include_bytes!("../static/ffmpeg/ffmpeg-core.wasm"), "application/wasm", true))
 		}.boxed());
 	app.at("/static/ffmpeg/814.ffmpeg.js")
-		.get(|_| resource(include_str!("../static/ffmpeg/814.ffmpeg.js"), "text/javascript", false).boxed());
+		.get(|_| resource(include_str!("../static/ffmpeg/814.ffmpeg.js"), "text/javascript", true).boxed());
 	
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
