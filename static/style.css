@@ -535,6 +535,12 @@ aside {
     padding: 8px 15px;
 }
 
+/* Hide dropdown content with display: none when closed so find-in-page
+   can't match it and auto-expand the details element */
+#feeds:not([open]) > #feed_list {
+    display: none;
+}
+
 #feed_list {
     position: absolute;
     display: flex;
