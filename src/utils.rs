@@ -1131,7 +1131,7 @@ pub fn render_bullet_lists(input_text: &str) -> String {
 // These are links we want to replace in-body
 static REDDIT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|)(reddit\.com|redd\.it)/"#).unwrap());
 static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)").unwrap());
-static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
+static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://(?:www\.)?redditstatic\.com/[^\s"'<>]*"#).unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
 
@@ -1141,15 +1141,9 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		// Rewrite Reddit links to Redlib
 		REDDIT_REGEX.replace_all(input_text, r#"href="/"#).to_string();
 
-	loop {
-		if REDDIT_EMOJI_REGEX.find(&text1).is_none() {
-			break;
-		} else {
-			text1 = REDDIT_EMOJI_REGEX
-				.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
-				.to_string()
-		}
-	}
+	text1 = REDDIT_EMOJI_REGEX
+		.replace_all(&text1, |captures: &regex::Captures<'_>| format_url(&captures[0]))
+		.to_string();
 
 	// Remove (html-encoded) "\" from URLs.
 	text1 = text1.replace("%5C", "").replace("\\_", "_");
@@ -1635,6 +1629,14 @@ fn test_rewriting_image_links() {
 	let input =
 		r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
 	let output = r#"<figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure>"#;
+	assert_eq!(rewrite_urls(input), output);
+}
+
+#[test]
+fn test_rewriting_multiple_static_urls_without_matching_other_hosts() {
+	let input = "<p>a <a href=\"https://www.redditstatic.com/one.png\">one</a> tail-A</p>\n<p>b <a href=\"https://www.redditstatic.com/two.png\">two</a> tail-B</p>\n<p>typo link https://xredditstatic.com/foo here</p>";
+	let output =
+		"<p>a <a href=\"/static/one.png\">one</a> tail-A</p>\n<p>b <a href=\"/static/two.png\">two</a> tail-B</p>\n<p>typo link https://xredditstatic.com/foo here</p>";
 	assert_eq!(rewrite_urls(input), output);
 }
 
