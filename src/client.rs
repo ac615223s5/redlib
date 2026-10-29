@@ -48,7 +48,7 @@ const SHREDDIT_MAX_REDIRECTS: usize = 3;
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
 // Shreddit serves mobile browsers 10 comments per fragment instead of 25.
-static SHREDDIT_CLIENT: LazyLock<WreqClient> = LazyLock::new(|| build_emulated_client(&[Platform::Windows]));
+static SHREDDIT_CLIENT: LazyLock<WreqClient> = LazyLock::new(|| build_emulated_client(DESKTOP_EMULATIONS));
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -91,23 +91,27 @@ impl Resolve for RedditDnsResolver {
 	}
 }
 
+// Reddit blocks some fingerprints outright (e.g. Chrome145 and Firefox147
+// now get a 403 on every API request), so only list ones known to work.
+// Keeping this list short to aid in privacy.
+const EMULATIONS: &[(Profile, Platform)] = &[
+	(Profile::OkHttp4_9, Platform::Android),
+	(Profile::FirefoxAndroid135, Platform::Android),
+	(Profile::Chrome131, Platform::Windows),
+];
+
+// Shreddit fragments are served to the desktop web client.
+const DESKTOP_EMULATIONS: &[(Profile, Platform)] = &[(Profile::Chrome131, Platform::Windows)];
+
 pub fn build_client() -> WreqClient {
-	build_emulated_client(&[Platform::Android, Platform::Windows])
+	build_emulated_client(EMULATIONS)
 }
 
-fn build_emulated_client(emulation_platform: &[Platform]) -> WreqClient {
-	// Keeping this list short to aid in privacy.
-	// The more emulations, the more unique a fingerprint each instance has.
-	// But some emulations should increase evasiveness.
-	let emulation = [Profile::Chrome145, Profile::Firefox147];
+fn build_emulated_client(emulations: &[(Profile, Platform)]) -> WreqClient {
+	let (profile, platform) = emulations[fastrand::usize(..emulations.len())];
+	let emulation = Emulation::builder().profile(profile).platform(platform).build();
 
-	let rand = fastrand::usize(..);
-	let emulation = Emulation::builder()
-		.profile(emulation[rand % emulation.len()])
-		.platform(emulation_platform[rand % emulation_platform.len()])
-		.build();
-
-	info!("Building Wreq client with random emulation");
+	info!("Building Wreq client with emulation {profile:?} on {platform:?}");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
@@ -627,7 +631,13 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
-							if status.is_server_error() {
+							if status == wreq::StatusCode::FORBIDDEN {
+								// Reddit's edge answers flagged sessions with an HTML "blocked"
+								// page, which persists until the token and device ID change.
+								error!("Reddit blocked the request, forcing a token refresh");
+								let () = force_refresh_token().await;
+								Err("Reddit blocked the request. A new session has been started, please refresh the page!".to_string())
+							} else if status.is_server_error() {
 								Err("Reddit is having issues, check if there's an outage".to_string())
 							} else {
 								err("Failed to parse page JSON data", e.to_string(), path)

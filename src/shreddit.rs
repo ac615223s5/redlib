@@ -398,6 +398,49 @@ fn unix_time(timestamp: &str) -> Option<f64> {
 		.map(|time| time.timestamp_millis() as f64 / 1000.0)
 }
 
+static HOVER_CARD: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"[data-testid="user-hover-card"]"#).unwrap());
+static NAMEPLATE: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"[data-testid="nameplate"]"#).unwrap());
+static AVATAR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[src]").unwrap());
+static CAKE_DAY: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"time[data-testid="cake-day"][datetime]"#).unwrap());
+static KARMA: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"[data-testid="karma-number"]"#).unwrap());
+
+/// Profile details shown on a user's hover card. The `about.json` endpoint is
+/// blocked for anonymous clients, so this is the only source of karma and
+/// account age.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HoverCard {
+	pub name: String,
+	pub avatar: String,
+	/// Unix seconds of the account's cake day.
+	pub created: f64,
+	/// Post karma plus comment karma.
+	pub karma: i64,
+}
+
+#[cached(size = 100, time = 600, result = true)]
+pub async fn user_hover_card(name: String) -> Result<HoverCard, String> {
+	if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+		return Err(format!("Invalid username | {name}"));
+	}
+	let html = shreddit_fragment(format!("/svc/shreddit/user-hover-card/{name}"), None).await?;
+	parse_hover_card(&html).ok_or_else(|| format!("User not found | {name}"))
+}
+
+/// Returns `None` when Reddit renders its error alert instead of a card,
+/// which happens for deleted, suspended and nonexistent accounts.
+fn parse_hover_card(html: &str) -> Option<HoverCard> {
+	let document = Html::parse_fragment(html);
+	let card = document.select(&HOVER_CARD).next()?;
+	let text = |element: ElementRef| element.text().collect::<String>().trim().to_string();
+
+	Some(HoverCard {
+		name: card.select(&NAMEPLATE).next().map(text).unwrap_or_default(),
+		avatar: card.select(&AVATAR).next().and_then(|img| img.attr("src")).unwrap_or_default().to_string(),
+		created: card.select(&CAKE_DAY).next().and_then(|time| time.attr("datetime")).and_then(unix_time).unwrap_or_default(),
+		karma: card.select(&KARMA).filter_map(|karma| text(karma).replace(',', "").parse::<i64>().ok()).sum(),
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -787,5 +830,39 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(5), crawl)
 			.await
 			.expect("c3 must start while c1 is still in flight");
+	}
+
+	#[test]
+	fn test_parse_hover_card() {
+		let html = r#"<faceplate-loader name="UserHoverCard_x"></faceplate-loader>
+<div class="user-hover-card" data-testid="user-hover-card"><div><a href="/user/spez/"><span avatar><img src="https://styles.redditmedia.com/t5_3k30p/styles/profileIcon_a.png" alt="u/spez avatar"></span></a>
+<a href="/user/spez/"><span dir="auto" data-testid="nameplate"> <span class="truncate">spez</span> </span></a>
+<span dir="auto">u/spez</span><time datetime="2005-06-06T00:00:00.000Z" data-testid="cake-day"> Jun 6, 2005 </time></div>
+<span>Reddit CEO</span>
+<div><span data-testid="karma-number"> 184,587 </span><div> Post karma </div></div>
+<div><span data-testid="karma-number"> 756,538 </span><div> Comment karma </div></div></div>"#;
+
+		assert_eq!(
+			parse_hover_card(html),
+			Some(HoverCard {
+				name: "spez".into(),
+				avatar: "https://styles.redditmedia.com/t5_3k30p/styles/profileIcon_a.png".into(),
+				created: 1_118_016_000.0,
+				karma: 941_125,
+			})
+		);
+	}
+
+	#[test]
+	fn test_parse_hover_card_missing_user() {
+		let html = r#"<ac-call method="close" target="closest(faceplate-hovercard)" trigger="init"></ac-call><faceplate-alert level="error" message="We had a server error..." cause="query-bad-response"></faceplate-alert>"#;
+		assert_eq!(parse_hover_card(html), None);
+	}
+
+	#[tokio::test]
+	async fn test_user_hover_card_rejects_invalid_names() {
+		for name in ["", "../comments", "a/b", "a?b"] {
+			assert!(user_hover_card(name.to_string()).await.is_err(), "{name}");
+		}
 	}
 }

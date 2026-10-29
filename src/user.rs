@@ -2,7 +2,7 @@
 use crate::client::json;
 use crate::server::RequestExt;
 use crate::utils::{error, filter_posts, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
-use crate::{config, utils};
+use crate::{config, shreddit, utils};
 use askama::Template;
 use chrono::DateTime;
 use htmlescape::decode_html;
@@ -106,29 +106,29 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 
 // USER
 async fn user(name: &str) -> Result<User, String> {
-	// Build the Reddit JSON API path
-	let path: String = format!("/user/{name}/about.json?raw_json=1");
+	// Reddit blocks /user/{name}/about.json for anonymous clients. Karma and
+	// account age come from the user's hover card instead, and the rest from
+	// the user's profile subreddit, which is still served as JSON.
+	let (card, profile) = tokio::join!(shreddit::user_hover_card(name.to_string()), json(format!("/r/u_{name}/about.json?raw_json=1"), false));
+	let card = card?;
+	let profile = profile.unwrap_or_default();
 
-	// Send a request to the url
-	json(path, false).await.map(|res| {
-		// Grab creation date as unix timestamp
-		let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
-		let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+	// Grab creation date as unix timestamp
+	let created = OffsetDateTime::from_unix_timestamp(card.created.round() as i64).unwrap_or(OffsetDateTime::UNIX_EPOCH);
 
-		// Closure used to parse JSON from Reddit APIs
-		let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
+	// Closure used to parse JSON from Reddit APIs
+	let about = |item| profile["data"][item].as_str().unwrap_or_default().to_string();
+	let icon = about("icon_img");
 
-		// Parse the JSON output into a User struct
-		User {
-			name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
-			title: about("title"),
-			icon: format_url(&about("icon_img")),
-			karma: res["data"]["total_karma"].as_i64().unwrap_or(0),
-			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
-			banner: about("banner_img"),
-			description: about("public_description"),
-			nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
-		}
+	Ok(User {
+		name: if card.name.is_empty() { name.to_owned() } else { card.name },
+		title: about("title"),
+		icon: format_url(if icon.is_empty() { &card.avatar } else { &icon }),
+		karma: card.karma,
+		created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
+		banner: about("banner_img"),
+		description: about("public_description"),
+		nsfw: profile["data"]["over18"].as_bool().unwrap_or_default(),
 	})
 }
 
