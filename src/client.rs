@@ -659,6 +659,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
 							if status == wreq::StatusCode::FORBIDDEN {
+								// Reddit also 403s individual endpoints it has put behind a login
+								// (e.g. r/all). Then the session is fine and must be left alone.
+								if session_works().await {
+									return err("Reddit refused this page, it may now require a login", status.to_string(), path);
+								}
 								// Reddit's edge answers flagged sessions with an HTML "blocked"
 								// page, which persists until the token and device ID change. The
 								// fingerprint itself may be what is blocked, so switch it too; the
@@ -679,6 +684,17 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 			}
 		}
 		Err(e) => err("Couldn't send request to Reddit", e, path),
+	}
+}
+
+/// Whether the current client and session can still load a page that works
+/// logged out, to tell a blocked session apart from a blocked endpoint. Cached
+/// briefly so repeated hits on a blocked endpoint don't each cost a request.
+#[cached(time = 30)]
+async fn session_works() -> bool {
+	match reddit_get("/r/popular/hot.json?limit=1&raw_json=1".to_string(), false).await {
+		Ok(response) => response.status().is_success(),
+		Err(_) => false,
 	}
 }
 

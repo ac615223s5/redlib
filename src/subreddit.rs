@@ -95,6 +95,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		}
 	}
 
+	// Reddit made r/all login-only in Oct 2026: www.reddit.com/r/all redirects
+	// home, old.reddit.com asks for a login, and the API answers with a 403.
+	if sub_name == "all" {
+		return info(req, "Reddit now requires a login to view r/all, so Redlib can't show it. r/popular is still available.").await;
+	}
+
 	let quarantined = can_access_quarantine(&req, &sub_name) || root;
 
 	// Handle random subreddits
