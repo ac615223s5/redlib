@@ -498,7 +498,7 @@ pub async fn proxy_commit_info() -> Result<Response<Body>, String> {
 async fn fetch_commit_info() -> String {
 	let url = "https://github.com/redlib-org/redlib/commits/main.atom";
 
-	CLIENT.get(url).send().await.expect("Failed to request GitHub").text().await.expect("Failed to read body")
+	CLIENT.load().get(url).send().await.expect("Failed to request GitHub").text().await.expect("Failed to read body")
 }
 
 pub async fn proxy_instances() -> Result<Response<Body>, String> {
@@ -515,5 +515,5 @@ pub async fn proxy_instances() -> Result<Response<Body>, String> {
 async fn fetch_instances() -> String {
 	let url = "https://raw.githubusercontent.com/redlib-org/redlib-instances/refs/heads/main/instances.json";
 
-	CLIENT.get(url).send().await.expect("Failed to request GitHub").text().await.expect("Failed to read body")
+	CLIENT.load().get(url).send().await.expect("Failed to request GitHub").text().await.expect("Failed to read body")
 }

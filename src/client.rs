@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::result::Result;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize};
 use std::sync::{Arc, LazyLock};
 use wreq::cookie::Jar;
 use wreq::dns::{Addrs, Name, Resolve, Resolving};
@@ -45,7 +45,16 @@ static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
 const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 const SHREDDIT_MAX_REDIRECTS: usize = 3;
 
-pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
+// Swappable so a fingerprint Reddit has started blocking can be replaced at
+// runtime (see rotate_client) instead of breaking the instance until restart.
+pub static CLIENT: LazyLock<ArcSwap<WreqClient>> = LazyLock::new(|| ArcSwap::from_pointee(build_client()));
+// Index into EMULATIONS of the profile CLIENT was built with.
+static CLIENT_EMULATION: AtomicUsize = AtomicUsize::new(0);
+// Unix time of the last rotation. A burst of 403s from one blocked
+// fingerprint must rotate once, not once per request (which, with an even
+// count, would land back on the blocked profile).
+static CLIENT_ROTATED_AT: AtomicU64 = AtomicU64::new(0);
+const CLIENT_ROTATE_COOLDOWN_SECS: u64 = 30;
 
 // Shreddit serves mobile browsers 10 comments per fragment instead of 25.
 static SHREDDIT_CLIENT: LazyLock<WreqClient> = LazyLock::new(|| build_emulated_client(DESKTOP_EMULATIONS));
@@ -91,24 +100,42 @@ impl Resolve for RedditDnsResolver {
 	}
 }
 
-// Reddit blocks some fingerprints outright (e.g. Chrome145 and Firefox147
-// now get a 403 on every API request), so only list ones known to work.
-// Keeping this list short to aid in privacy.
-const EMULATIONS: &[(Profile, Platform)] = &[
-	(Profile::OkHttp4_9, Platform::Android),
-	(Profile::FirefoxAndroid135, Platform::Android),
-	(Profile::Chrome131, Platform::Windows),
-];
+// Reddit blocks some fingerprints outright (e.g. Chrome145, Firefox147 and,
+// since 2026-10-30, FirefoxAndroid135 get a 403 on every API request), so
+// only list ones known to work. Keeping this list short to aid in privacy.
+const EMULATIONS: &[(Profile, Platform)] = &[(Profile::OkHttp4_9, Platform::Android), (Profile::Chrome131, Platform::Windows)];
 
 // Shreddit fragments are served to the desktop web client.
 const DESKTOP_EMULATIONS: &[(Profile, Platform)] = &[(Profile::Chrome131, Platform::Windows)];
 
 pub fn build_client() -> WreqClient {
-	build_emulated_client(EMULATIONS)
+	let index = fastrand::usize(..EMULATIONS.len());
+	CLIENT_EMULATION.store(index, Ordering::SeqCst);
+	build_client_with(EMULATIONS[index])
+}
+
+/// Replaces CLIENT with one using the next profile in EMULATIONS, for when
+/// Reddit starts blocking the current fingerprint.
+pub fn rotate_client() {
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+	let last = CLIENT_ROTATED_AT.load(Ordering::SeqCst);
+	if now.saturating_sub(last) < CLIENT_ROTATE_COOLDOWN_SECS
+		|| CLIENT_ROTATED_AT.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err()
+	{
+		return;
+	}
+	let index = (CLIENT_EMULATION.load(Ordering::SeqCst) + 1) % EMULATIONS.len();
+	CLIENT_EMULATION.store(index, Ordering::SeqCst);
+	let (profile, platform) = EMULATIONS[index];
+	warn!("Switching to emulation {profile:?} on {platform:?} after Reddit blocked the current one");
+	CLIENT.store(Arc::new(build_client_with((profile, platform))));
 }
 
 fn build_emulated_client(emulations: &[(Profile, Platform)]) -> WreqClient {
-	let (profile, platform) = emulations[fastrand::usize(..emulations.len())];
+	build_client_with(emulations[fastrand::usize(..emulations.len())])
+}
+
+fn build_client_with((profile, platform): (Profile, Platform)) -> WreqClient {
 	let emulation = Emulation::builder().profile(profile).platform(platform).build();
 
 	info!("Building Wreq client with emulation {profile:?} on {platform:?}");
@@ -219,7 +246,7 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	// First parameter is target URL (mandatory).
 	let wreq_uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())?;
 
-	let mut builder = CLIENT.get(wreq_uri);
+	let mut builder = CLIENT.load().get(wreq_uri);
 
 	// Copy useful headers from original request
 	for &key in &["Range", "If-Modified-Since", "Cache-Control"] {
@@ -407,7 +434,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let mut builder = CLIENT.request(method.clone(), &url);
+	let mut builder = CLIENT.load().request(method.clone(), &url);
 
 	for (key, value) in headers {
 		builder = builder.header(key, value);
@@ -633,8 +660,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
 							if status == wreq::StatusCode::FORBIDDEN {
 								// Reddit's edge answers flagged sessions with an HTML "blocked"
-								// page, which persists until the token and device ID change.
-								error!("Reddit blocked the request, forcing a token refresh");
+								// page, which persists until the token and device ID change. The
+								// fingerprint itself may be what is blocked, so switch it too; the
+								// refresh then fetches its token with the new one.
+								error!("Reddit blocked the request, switching fingerprint and forcing a token refresh");
+								rotate_client();
 								let () = force_refresh_token().await;
 								Err("Reddit blocked the request. A new session has been started, please refresh the page!".to_string())
 							} else if status.is_server_error() {
