@@ -1122,6 +1122,17 @@ a.search_subreddit:hover {
     vertical-align: bottom;
 }
 
+/* Post page: scale large images down to fit both the column and the viewport */
+.post_media_image.fit svg,
+.post_media_image.fit img {
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 75vh;
+    display: block;
+    margin: auto;
+}
+
 .gallery img {
     max-width: 100%;
     vertical-align: bottom;
