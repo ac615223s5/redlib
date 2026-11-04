@@ -1,9 +1,10 @@
-//! Comment trees from Reddit's server-rendered web frontend ("shreddit").
+//! Comment trees and search results from Reddit's server-rendered web frontend ("shreddit").
 //!
-//! Reddit's edge blocks the OAuth comments API for anonymous clients, but
-//! reddit.com still serves logged-out visitors HTML fragments of comment
-//! trees. This module crawls those fragments and converts them into the API's
-//! `Listing` JSON, so comment parsing and rendering stay unchanged.
+//! Reddit's edge blocks the OAuth comments and search APIs for anonymous
+//! clients, but reddit.com still serves logged-out visitors HTML fragments of
+//! comment trees and search results. This module crawls those fragments and
+//! converts them into the API's `Listing` JSON, so parsing and rendering stay
+//! unchanged.
 
 use crate::client::shreddit_fragment;
 use cached::proc_macro::cached;
@@ -11,10 +12,11 @@ use chrono::DateTime;
 use log::warn;
 use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::LazyLock;
 use tokio::task::JoinSet;
+use url::{form_urlencoded, Url};
 
 /// How much of a comment tree is crawled beyond the first fragment.
 #[derive(Clone, Copy)]
@@ -441,6 +443,148 @@ fn parse_hover_card(html: &str) -> Option<HoverCard> {
 	})
 }
 
+// SEARCH
+
+/// Result fragments fetched per search page. Reddit puts 7 posts in each.
+const SEARCH_FRAGMENTS_PER_PAGE: usize = 3;
+
+/// One post card; its telemetry context carries the post's metadata as JSON.
+static SEARCH_POST: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"search-telemetry-tracker[view-events="search/view/post"][data-faceplate-tracking-context]"#).unwrap());
+static SEARCH_TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"a[data-testid="post-title"][href]"#).unwrap());
+static SEARCH_COUNTER: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"[data-testid="search-counter-row"] > span"#).unwrap());
+static SEARCH_THUMBNAIL: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-img[data-testid="search_post_thumbnail"][src]"#).unwrap());
+/// The lazily loaded next page of results.
+static SEARCH_NEXT: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[loading="lazy"][src*="cursor="]"#).unwrap());
+
+/// Search posts, site-wide or within `subreddit` (`a+b` searches several), as
+/// a Reddit API `Listing`. Its `after` is Reddit's cursor for the next page.
+///
+/// Logged-out search is Reddit's safe search: NSFW posts are never returned.
+#[cached(size = 100, time = 60, result = true)]
+pub async fn search(subreddit: Option<String>, query: String, sort: String, time: String, cursor: Option<String>) -> Result<Value, String> {
+	let mut posts = Vec::new();
+	let mut seen = HashSet::new();
+	let mut cursor = cursor;
+	for _ in 0..SEARCH_FRAGMENTS_PER_PAGE {
+		let path = search_path(subreddit.as_deref(), &query, &sort, &time, cursor.as_deref())?;
+		let page = parse_search_fragment(&shreddit_fragment(path, None).await?);
+		posts.extend(page.posts.into_iter().filter(|post| seen.insert(post["data"]["id"].as_str().unwrap_or_default().to_string())));
+		cursor = page.cursor;
+		if cursor.is_none() {
+			break;
+		}
+	}
+
+	Ok(json!({ "kind": "Listing", "data": { "after": cursor.unwrap_or_default(), "children": posts } }))
+}
+
+fn search_path(subreddit: Option<&str>, query: &str, sort: &str, time: &str, cursor: Option<&str>) -> Result<String, String> {
+	let subreddits: Vec<&str> = subreddit.map(|sub| sub.split('+').filter(|name| !name.is_empty()).collect()).unwrap_or_default();
+	if !subreddits.iter().all(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+		return Err(format!("Invalid subreddit name | {}", subreddit.unwrap_or_default()));
+	}
+
+	// Subreddit search pages only cover one subreddit, so several are searched
+	// site-wide with Reddit's subreddit: operator.
+	let (base, query) = match subreddits.as_slice() {
+		[] => ("/svc/shreddit/search/".to_string(), query.to_string()),
+		[name] => (format!("/svc/shreddit/r/{name}/search/"), query.to_string()),
+		names => (
+			"/svc/shreddit/search/".to_string(),
+			format!("{query} ({})", names.iter().map(|name| format!("subreddit:{name}")).collect::<Vec<_>>().join(" OR ")),
+		),
+	};
+
+	let mut params = form_urlencoded::Serializer::new(String::new());
+	params.append_pair("q", &query);
+	for (name, value) in [("sort", sort), ("t", time), ("cursor", cursor.unwrap_or_default())] {
+		if !value.is_empty() {
+			params.append_pair(name, value);
+		}
+	}
+	Ok(format!("{base}?{}", params.finish()))
+}
+
+struct SearchFragment {
+	posts: Vec<Value>,
+	cursor: Option<String>,
+}
+
+fn parse_search_fragment(html: &str) -> SearchFragment {
+	let document = Html::parse_document(html);
+	SearchFragment {
+		posts: document.select(&SEARCH_POST).filter_map(parse_search_post).collect(),
+		cursor: document.select(&SEARCH_NEXT).find_map(|element| query_param(element.value().attr("src")?, "cursor")),
+	}
+}
+
+fn parse_search_post(element: ElementRef<'_>) -> Option<Value> {
+	let context: Value = serde_json::from_str(element.value().attr("data-faceplate-tracking-context")?).ok()?;
+	let post = &context["post"];
+	let id = post["id"].as_str()?.strip_prefix("t3_")?;
+	let title_link = element.select(&SEARCH_TITLE).next()?;
+	let permalink = title_link.value().attr("href")?;
+	let title = post["title"].as_str().or_else(|| title_link.value().attr("aria-label")).unwrap_or_default();
+	let subreddit = context["subreddit"]["name"]
+		.as_str()
+		.or_else(|| permalink.strip_prefix("/r/")?.split('/').next())
+		.unwrap_or_default();
+
+	let created = element
+		.select(&TIMEAGO)
+		.next()
+		.and_then(|time| unix_time(time.value().attr("ts")?))
+		.unwrap_or_default();
+
+	let (mut score, mut comments) = (None, 0);
+	for counter in element.select(&SEARCH_COUNTER) {
+		let Some(number) = counter.select(&COUNT).next().and_then(|count| count.value().attr("number")?.parse::<i64>().ok()) else {
+			continue;
+		};
+		if counter.text().any(|text| text.contains("comment")) {
+			comments = number;
+		} else {
+			score = Some(number);
+		}
+	}
+
+	let thumbnail = element.select(&SEARCH_THUMBNAIL).next().and_then(|image| image.value().attr("src")).unwrap_or_default();
+	let thumbnail_size = |name: &str| query_param(thumbnail, name).and_then(|size| size.parse::<i64>().ok()).unwrap_or(140);
+
+	Some(json!({
+		"kind": "t3",
+		"data": {
+			"id": id,
+			"name": format!("t3_{id}"),
+			"title": title,
+			"subreddit": subreddit,
+			"author": context["profile"]["name"].as_str().unwrap_or("[deleted]"),
+			"permalink": permalink,
+			"url": permalink,
+			// Cards don't say what a post links to, so posts with a thumbnail are
+			// shown as links to their comments and the rest as text posts.
+			// No selftext: the snippet on site-wide cards is often a matching
+			// comment rather than the post's text.
+			"is_self": thumbnail.is_empty(),
+			"thumbnail": thumbnail,
+			"thumbnail_width": thumbnail_size("width"),
+			"thumbnail_height": thumbnail_size("height"),
+			"score": score.unwrap_or_default(),
+			"hide_score": score.is_none(),
+			"num_comments": comments,
+			"created_utc": created,
+			"over_18": post["nsfw"].as_bool().unwrap_or_default() || context["subreddit"]["nsfw"].as_bool().unwrap_or_default(),
+			"spoiler": post["spoiler"].as_bool().unwrap_or_default(),
+		}
+	}))
+}
+
+/// The value of query parameter `name` in a URL or root-relative path.
+fn query_param(url: &str, name: &str) -> Option<String> {
+	let url = Url::parse(url).or_else(|_| Url::parse("https://www.reddit.com")?.join(url)).ok()?;
+	url.query_pairs().find(|(key, _)| key == name).map(|(_, value)| value.into_owned())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -863,6 +1007,87 @@ mod tests {
 	async fn test_user_hover_card_rejects_invalid_names() {
 		for name in ["", "../comments", "a/b", "a?b"] {
 			assert!(user_hover_card(name.to_string()).await.is_err(), "{name}");
+		}
+	}
+
+	const SEARCH_FRAGMENT: &str = r#"
+<search-telemetry-tracker data-faceplate-tracking-context="{&quot;post&quot;:{&quot;id&quot;:&quot;t3_abc&quot;,&quot;nsfw&quot;:false,&quot;spoiler&quot;:true,&quot;title&quot;:&quot;Fish &amp; chips &lt;3&quot;},&quot;profile&quot;:{&quot;id&quot;:&quot;t2_x&quot;,&quot;name&quot;:&quot;alice&quot;},&quot;subreddit&quot;:{&quot;id&quot;:&quot;t5_y&quot;,&quot;name&quot;:&quot;food&quot;,&quot;nsfw&quot;:false}}" view-events="search/view/post" data-testid="search-sdui-post" data-thingid="t3_abc"><div data-testid="search-post-unit">
+  <search-telemetry-tracker data-faceplate-tracking-context="{}" click-events="search/click/post"><h2><a data-testid="post-title" href="/r/food/comments/abc/fish_chips/" aria-label="Fish &amp; chips &lt;3"></a></h2></search-telemetry-tracker>
+  <div data-testid="sdui-post-unit">
+    <div><span><faceplate-timeago format="narrow" ts="2024-05-02T13:00:55.859000+0000"></faceplate-timeago></span></div>
+    <a data-testid="post-title-text" href="/r/food/comments/abc/fish_chips/">Fish &amp; chips</a>
+    <div data-testid="search-counter-row"><span><faceplate-number number="1234" pretty></faceplate-number> votes</span><span>·</span><span><faceplate-number number="7" pretty></faceplate-number> comments</span></div>
+  </div>
+  <search-telemetry-tracker data-faceplate-tracking-context="{}" click-events="search/click/post"><a href="/r/food/comments/abc/fish_chips/"><faceplate-img data-testid="search_post_thumbnail" src="https://preview.redd.it/x.jpg?width=140&amp;height=78&amp;s=1"></faceplate-img></a></search-telemetry-tracker>
+</div></search-telemetry-tracker>
+<hr>
+<search-telemetry-tracker data-faceplate-tracking-context="{&quot;post&quot;:{&quot;id&quot;:&quot;t3_def&quot;,&quot;nsfw&quot;:false,&quot;spoiler&quot;:false,&quot;title&quot;:&quot;Text post&quot;},&quot;subreddit&quot;:{&quot;name&quot;:&quot;food&quot;,&quot;nsfw&quot;:true}}" view-events="search/view/post"><div data-testid="search-post-with-content-preview">
+  <h2><a data-testid="post-title" href="/r/food/comments/def/text_post/" aria-label="Text post"></a></h2>
+  <div data-testid="sdui-post-unit">
+    <a data-testid="post-title-text" href="/r/food/comments/def/text_post/">Text post</a>
+    <search-telemetry-tracker data-faceplate-tracking-context="{}" click-events="search/click/post"><a href="/r/food/comments/def/text_post/">
+      Body <b>preview</b>
+    </a></search-telemetry-tracker>
+    <div data-testid="search-counter-row"><span><faceplate-number number="2" pretty></faceplate-number> comments</span></div>
+  </div>
+</div></search-telemetry-tracker>
+<search-telemetry-tracker data-faceplate-tracking-context="not json" view-events="search/view/post"></search-telemetry-tracker>
+<faceplate-partial src="/svc/shreddit/community-hover-card/food" loading="programmatic"></faceplate-partial>
+<faceplate-partial loading="lazy" src="/svc/shreddit/r/food/search/?q=fish&amp;cursor=eyJhIjoiYiJ9%3D%3D&amp;cId=1"></faceplate-partial>
+"#;
+
+	#[test]
+	fn test_parse_search_fragment() {
+		let page = parse_search_fragment(SEARCH_FRAGMENT);
+		assert_eq!(page.cursor.as_deref(), Some("eyJhIjoiYiJ9=="));
+		assert_eq!(page.posts.len(), 2);
+
+		let link = &page.posts[0]["data"];
+		assert_eq!(link["id"], "abc");
+		assert_eq!(link["title"], "Fish & chips <3");
+		assert_eq!(link["subreddit"], "food");
+		assert_eq!(link["author"], "alice");
+		assert_eq!(link["permalink"], "/r/food/comments/abc/fish_chips/");
+		assert_eq!(link["score"], 1234);
+		assert_eq!(link["hide_score"], false);
+		assert_eq!(link["num_comments"], 7);
+		assert_eq!(link["created_utc"], 1_714_654_855.859);
+		assert_eq!(link["spoiler"], true);
+		assert_eq!(link["over_18"], false);
+		assert_eq!(link["is_self"], false);
+		assert_eq!(link["thumbnail"], "https://preview.redd.it/x.jpg?width=140&height=78&s=1");
+		assert_eq!((link["thumbnail_width"].as_i64(), link["thumbnail_height"].as_i64()), (Some(140), Some(78)));
+
+		let text = &page.posts[1]["data"];
+		assert_eq!(text["author"], "[deleted]");
+		assert_eq!(text["over_18"], true);
+		assert_eq!(text["is_self"], true);
+		assert_eq!(text["hide_score"], true);
+		assert_eq!(text["num_comments"], 2);
+		// The site-wide snippet is often a matching comment, not the post's text.
+		assert!(text["selftext_html"].is_null());
+	}
+
+	#[test]
+	fn test_parse_search_fragment_without_results() {
+		let page = parse_search_fragment(r#"<div data-testid="search-error-message">Hm...we couldn’t find any results</div>"#);
+		assert!(page.posts.is_empty());
+		assert_eq!(page.cursor, None);
+	}
+
+	#[test]
+	fn test_search_path() {
+		assert_eq!(search_path(None, "a b&c", "", "", None).unwrap(), "/svc/shreddit/search/?q=a+b%26c");
+		assert_eq!(
+			search_path(Some("rust"), "async", "top", "week", Some("eyJ+/==")).unwrap(),
+			"/svc/shreddit/r/rust/search/?q=async&sort=top&t=week&cursor=eyJ%2B%2F%3D%3D"
+		);
+		assert_eq!(
+			search_path(Some("rust+golang"), "async", "new", "", None).unwrap(),
+			"/svc/shreddit/search/?q=async+%28subreddit%3Arust+OR+subreddit%3Agolang%29&sort=new"
+		);
+		for sub in ["../comments", "a/b", "a?b", "r%2F"] {
+			assert!(search_path(Some(sub), "q", "", "", None).is_err(), "{sub}");
 		}
 	}
 }

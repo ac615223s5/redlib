@@ -1,10 +1,6 @@
 #![allow(clippy::cmp_owned)]
 use crate::utils::{self, catch_random, error, filter_posts, format_num, format_url, get_filters, param, redirect, setting, template, val, Post, Preferences};
-use crate::{
-	client::json,
-	server::RequestExt,
-	subreddit::{can_access_quarantine, quarantine},
-};
+use crate::{client::json, server::RequestExt, shreddit};
 use askama::Template;
 use hyper::{Body, Request, Response};
 use regex::Regex;
@@ -82,7 +78,6 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let sub = req.param("sub").unwrap_or_default();
-	let quarantined = can_access_quarantine(&req, &sub);
 	// Handle random subreddits
 	if let Ok(random) = catch_random(&sub, "/find").await {
 		return Ok(random);
@@ -127,11 +122,11 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 			no_posts: false,
 		}))
 	} else {
-		match Post::fetch(&path, quarantined).await {
+		match search_posts(&path, &sub, &sort, &typed).await {
 			Ok((mut posts, after)) => {
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
-				let no_posts = posts.is_empty();
-				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				let no_posts = posts.is_empty() && typed != "sr_user";
+				let all_posts_hidden_nsfw = !posts.is_empty() && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				Ok(template(&SearchTemplate {
 					posts,
 					subreddits,
@@ -140,8 +135,9 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 						q: query.replace('"', "&quot;"),
 						sort,
 						t: param(&path, "t").unwrap_or_default(),
-						before: param(&path, "after").unwrap_or_default(),
-						after,
+						// Reddit's search cursors only lead forward.
+						before: String::new(),
+						after: url::form_urlencoded::byte_serialize(after.as_bytes()).collect(),
 						restrict_sr: param(&path, "restrict_sr").unwrap_or_default(),
 						typed,
 					},
@@ -153,16 +149,30 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 					no_posts,
 				}))
 			}
-			Err(msg) => {
-				if msg == "quarantined" || msg == "gated" {
-					let sub = req.param("sub").unwrap_or_default();
-					Ok(quarantine(&req, sub, &msg))
-				} else {
-					error(req, &msg).await
-				}
-			}
+			Err(msg) => error(req, &msg).await,
 		}
 	}
+}
+
+/// Post results for the search in `path`. Reddit blocks the search API for
+/// anonymous clients, so results come from the web frontend's fragments.
+async fn search_posts(path: &str, sub: &str, sort: &str, typed: &str) -> Result<(Vec<Post>, String), String> {
+	// Subreddit-only results don't show posts.
+	if typed == "sr_user" {
+		return Ok((Vec::new(), String::new()));
+	}
+
+	// Without restrict_sr, Reddit searches site-wide even from a subreddit.
+	let scope = (!sub.is_empty() && !matches!(sub, "all" | "popular") && param(path, "restrict_sr").is_some()).then(|| sub.to_string());
+	let listing = shreddit::search(
+		scope,
+		param(path, "q").unwrap_or_default(),
+		sort.to_string(),
+		param(path, "t").unwrap_or_default(),
+		param(path, "after").filter(|cursor| !cursor.is_empty()),
+	)
+	.await?;
+	Post::from_listing(&listing).await
 }
 
 async fn search_subreddits(q: &str, typed: &str) -> Vec<Subreddit> {

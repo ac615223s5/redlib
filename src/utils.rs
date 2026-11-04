@@ -398,6 +398,11 @@ impl Post {
 			Err(msg) => return Err(msg),
 		};
 
+		Self::from_listing(&res).await
+	}
+
+	/// Parse the posts of a Reddit API `Listing` and return them with its "after" value
+	pub async fn from_listing(res: &Value) -> Result<(Vec<Self>, String), String> {
 		// Fetch the list of posts from the JSON response
 		let Some(post_list) = res["data"]["children"].as_array() else {
 			return Err("No posts found".to_string());
