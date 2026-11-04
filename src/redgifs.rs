@@ -80,6 +80,7 @@ async fn get_token() -> Result<String, String> {
 
 async fn get_json(url: &str, token: Option<&str>) -> Result<Value, String> {
 	let mut builder = CLIENT
+		.load()
 		.get(url)
 		.header("referer", "https://www.redgifs.com/")
 		.header("origin", "https://www.redgifs.com")
