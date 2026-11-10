@@ -4,7 +4,7 @@ use crate::utils::{
 	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, to_absolute_url, val, Post,
 	Preferences, Subreddit,
 };
-use crate::{client::json, server::RequestExt, server::ResponseExt};
+use crate::{client::json, server::RequestExt, server::ResponseExt, shreddit};
 use crate::{config, utils};
 use askama::Template;
 use cookie::Cookie;
@@ -472,24 +472,27 @@ pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let page = req.param("page").unwrap_or_else(|| "index".to_string());
-	let path: String = format!("/r/{sub}/wiki/{page}.json?raw_json=1");
 	let url = req.uri().to_string();
 
-	match json(path, quarantined).await {
-		Ok(response) => Ok(template(&WikiTemplate {
+	// Reddit blocks the wiki API for anonymous clients, so the page comes from
+	// reddit.com. Its HTML doesn't say why a sub is unavailable, so ask the API.
+	if let Err(msg) = json(format!("/r/{sub}/about.json?raw_json=1"), quarantined).await {
+		return if msg == "quarantined" || msg == "gated" {
+			Ok(quarantine(&req, sub, &msg))
+		} else {
+			error(req, &msg).await
+		};
+	}
+
+	match shreddit::wiki(sub.clone(), page.clone()).await {
+		Ok(content) => Ok(template(&WikiTemplate {
 			sub,
-			wiki: rewrite_urls(response["data"]["content_html"].as_str().unwrap_or("<h3>Wiki not found</h3>")),
+			wiki: rewrite_urls(content.as_deref().unwrap_or("<h3>Wiki not found</h3>")),
 			page,
 			prefs: Preferences::new(&req),
 			url,
 		})),
-		Err(msg) => {
-			if msg == "quarantined" || msg == "gated" {
-				Ok(quarantine(&req, sub, &msg))
-			} else {
-				error(req, &msg).await
-			}
-		}
+		Err(msg) => error(req, &msg).await,
 	}
 }
 

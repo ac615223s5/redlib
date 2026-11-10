@@ -300,35 +300,101 @@ pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<S
 		return Err(format!("Refusing to fetch non-shreddit path | {path}"));
 	}
 
-	if let Some(body) = shreddit_request(&path, cursor.as_deref()).await? {
+	if let Some(body) = shreddit_request(&path, cursor.as_deref(), None, shreddit_redirect_target).await? {
 		return Ok(body);
 	}
 
 	warn!("Reddit rate limited the shreddit session, starting a new one");
 	SHREDDIT_SESSION.clear();
-	shreddit_request(&path, cursor.as_deref())
+	shreddit_request(&path, cursor.as_deref(), None, shreddit_redirect_target)
 		.await?
 		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
 }
 
+/// Fetch a page of Reddit's web frontend as a logged-out visitor, for pages
+/// whose API endpoint is blocked (e.g. wikis). Reddit puts a JavaScript
+/// challenge in front of some of these pages, which is solved here.
+pub async fn web_page(path: String) -> Result<String, String> {
+	if !path.starts_with("/r/") || path.contains("//") || path.contains(SHREDDIT_PATH_PREFIX) {
+		return Err(format!("Refusing to fetch non-page path | {path}"));
+	}
+
+	if let Some(body) = web_page_request(&path).await? {
+		return Ok(body);
+	}
+
+	warn!("Reddit rate limited or challenged the shreddit session, starting a new one");
+	SHREDDIT_SESSION.clear();
+	web_page_request(&path)
+		.await?
+		.ok_or_else(|| format!("Reddit is rate limiting page requests. Try refreshing in a few seconds. | {path}"))
+}
+
 /// Returns `Ok(None)` when Reddit rate limits or challenges the session.
-async fn shreddit_request(path: &str, cursor: Option<&str>) -> Result<Option<String>, String> {
+async fn web_page_request(path: &str) -> Result<Option<String>, String> {
+	let Some(body) = shreddit_request(path, None, None, web_page_redirect_target).await? else {
+		return Ok(None);
+	};
+	let Some(challenge) = js_challenge(path, &body) else {
+		return Ok(Some(body));
+	};
+
+	// Reddit only accepts the solution with the challenged page as referer, and
+	// answers it with a bot-check redirect back to the page.
+	let referer = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
+	let body = shreddit_request(&challenge, None, Some(&referer), web_page_redirect_target).await?;
+	Ok(body.filter(|body| js_challenge(path, body).is_none()))
+}
+
+/// Marks the JavaScript challenge page Reddit serves instead of some pages.
+const JS_CHALLENGE_INPUT: &str = r#"<input type="hidden" name="js_challenge""#;
+
+/// The URL that answers the JavaScript challenge in `body`, if `body` is one.
+///
+/// The challenge script submits a form whose `solution` is a seed concatenated
+/// with itself, plus the form's hidden fields.
+fn js_challenge(path: &str, body: &str) -> Option<String> {
+	if !body.contains(JS_CHALLENGE_INPUT) {
+		return None;
+	}
+	let between = |start: &str, end: char| body.split_once(start).and_then(|(_, rest)| rest.split(end).next());
+	let seed = between("(async e=>e+e)(\"", '"')?;
+	let field = |name: &str| between(&format!(r#"name="{name}" value=""#), '"').unwrap_or_default();
+
+	let query = url::form_urlencoded::Serializer::new(String::new())
+		.append_pair("solution", &format!("{seed}{seed}"))
+		.append_pair("js_challenge", "1")
+		.append_pair("jsc_token", field("jsc_token"))
+		.append_pair("jsc_orig_r", field("jsc_orig_r"))
+		.finish();
+	let base = path.split('?').next().unwrap_or(path);
+	Some(format!("{base}?{query}"))
+}
+
+/// Resolves a redirect `Location` to a page path on reddit.com, refusing anything else.
+fn web_page_redirect_target(location: &str) -> Option<&str> {
+	let path = location.strip_prefix(ALTERNATIVE_REDDIT_URL_BASE).unwrap_or(location);
+	(path.starts_with("/r/") && !path.contains("//")).then_some(path)
+}
+
+/// Returns `Ok(None)` when Reddit rate limits or challenges the session.
+async fn shreddit_request(path: &str, cursor: Option<&str>, referer: Option<&str>, redirect_target: fn(&str) -> Option<&str>) -> Result<Option<String>, String> {
 	// Reddit's bot check answers some clients with a 302 to the same path plus an
 	// `rdt` query parameter and cookie, so a few redirects are expected. The
 	// original method and cursor are kept so "more comments" POSTs still work.
 	let mut target = path.to_owned();
 	for _ in 0..=SHREDDIT_MAX_REDIRECTS {
-		let response = shreddit_send(&target, cursor).await?;
+		let response = shreddit_send(&target, cursor, referer).await?;
 		if !response.status().is_redirection() {
 			return shreddit_body(response, path).await;
 		}
 
 		let location = response.headers().get(wreq_header::LOCATION).and_then(|value| value.to_str().ok()).unwrap_or_default();
-		target = shreddit_redirect_target(location)
-			.ok_or_else(|| format!("Reddit redirected the comments request to {location:?} | {path}"))?
+		target = redirect_target(location)
+			.ok_or_else(|| format!("Reddit redirected the request to {location:?} | {path}"))?
 			.to_owned();
 	}
-	Err(format!("Reddit redirected the comments request too many times | {path}"))
+	Err(format!("Reddit redirected the request too many times | {path}"))
 }
 
 /// Resolves a redirect `Location` to a shreddit path on reddit.com, refusing anything else.
@@ -337,10 +403,10 @@ fn shreddit_redirect_target(location: &str) -> Option<&str> {
 	path.starts_with(SHREDDIT_PATH_PREFIX).then_some(path)
 }
 
-async fn shreddit_send(path: &str, cursor: Option<&str>) -> Result<WreqResponse, String> {
+async fn shreddit_send(path: &str, cursor: Option<&str>, referer: Option<&str>) -> Result<WreqResponse, String> {
 	let url = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
 
-	let builder = match cursor {
+	let mut builder = match cursor {
 		// Reddit's edge blocks POSTs that lack the Origin and Referer a browser sends.
 		Some(cursor) => SHREDDIT_CLIENT
 			.post(&url)
@@ -353,6 +419,9 @@ async fn shreddit_send(path: &str, cursor: Option<&str>) -> Result<WreqResponse,
 			.body(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish()),
 		None => SHREDDIT_CLIENT.get(&url),
 	};
+	if let Some(referer) = referer {
+		builder = builder.header(wreq_header::REFERER, referer);
+	}
 
 	builder
 		.header(wreq_header::ACCEPT, SHREDDIT_PARTIAL_ACCEPT)
@@ -843,6 +912,43 @@ mod tests {
 			("", None),
 		] {
 			assert_eq!(shreddit_redirect_target(location), expected, "{location}");
+		}
+	}
+
+	#[test]
+	fn test_js_challenge() {
+		let page = r#"<script>document.addEventListener("DOMContentLoaded",async function(){var e=document.forms[0],n=(e.onsubmit=function(t){},await(async e=>e+e)("67b2e6e9ee1ef1c1"));e.requestSubmit()},{once:!0});</script>
+      <form hidden method="GET" action="/r/rust/wiki/index/">
+        <input type="hidden" name="solution" />
+        <input type="hidden" name="js_challenge" value="1"/>
+        <input type="hidden" name="jsc_token" value="2824be10"/>
+        <input type="hidden" name="jsc_orig_r" value=""/>
+      </form>"#;
+		assert_eq!(
+			js_challenge("/r/rust/wiki/index/", page).as_deref(),
+			Some("/r/rust/wiki/index/?solution=67b2e6e9ee1ef1c167b2e6e9ee1ef1c1&js_challenge=1&jsc_token=2824be10&jsc_orig_r=")
+		);
+		assert_eq!(js_challenge("/r/rust/wiki/index/", r#"<div class="md wiki">js_challenge</div>"#), None);
+	}
+
+	#[test]
+	fn test_web_page_redirect_target() {
+		for (location, expected) in [
+			("/r/rust/wiki/index/?rdt=123", Some("/r/rust/wiki/index/?rdt=123")),
+			("https://www.reddit.com/r/rust/wiki/index/", Some("/r/rust/wiki/index/")),
+			("/login/?dest=%2Fr%2Frust", None),
+			("https://evil.example/r/rust/wiki/", None),
+			("//evil.example/r/rust/wiki/", None),
+		] {
+			assert_eq!(web_page_redirect_target(location), expected, "{location}");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_web_page_rejects_other_paths() {
+		for path in ["/api/v1/me", "/svc/shreddit/comments/x", "https://evil.example/r/rust", "/r//evil.example"] {
+			let error = web_page(path.to_string()).await.unwrap_err();
+			assert!(error.starts_with("Refusing to fetch non-page path"), "{path}: {error}");
 		}
 	}
 

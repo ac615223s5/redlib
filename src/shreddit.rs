@@ -1,12 +1,12 @@
-//! Comment trees and search results from Reddit's server-rendered web frontend ("shreddit").
+//! Comment trees, search results and wiki pages from Reddit's server-rendered web frontend ("shreddit").
 //!
-//! Reddit's edge blocks the OAuth comments and search APIs for anonymous
+//! Reddit's edge blocks the OAuth comments, search and wiki APIs for anonymous
 //! clients, but reddit.com still serves logged-out visitors HTML fragments of
-//! comment trees and search results. This module crawls those fragments and
-//! converts them into the API's `Listing` JSON, so parsing and rendering stay
-//! unchanged.
+//! comment trees and search results, and full wiki pages. This module crawls
+//! those and converts them into what the API returned, so parsing and
+//! rendering stay unchanged.
 
-use crate::client::shreddit_fragment;
+use crate::client::{shreddit_fragment, web_page};
 use cached::proc_macro::cached;
 use chrono::DateTime;
 use log::warn;
@@ -585,6 +585,23 @@ fn query_param(url: &str, name: &str) -> Option<String> {
 	url.query_pairs().find(|(key, _)| key == name).map(|(_, value)| value.into_owned())
 }
 
+// WIKI
+
+/// The rendered wiki page, as the API's `content_html` had it.
+static WIKI_CONTENT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("div.md.wiki").unwrap());
+
+/// The HTML of a subreddit's wiki `page`, or `None` if it doesn't exist or
+/// can't be viewed logged out.
+#[cached(size = 100, time = 300, result = true)]
+pub async fn wiki(subreddit: String, page: String) -> Result<Option<String>, String> {
+	let path = format!("/r/{subreddit}/wiki/{}/", page.trim_matches('/'));
+	Ok(parse_wiki(&web_page(path).await?))
+}
+
+fn parse_wiki(html: &str) -> Option<String> {
+	Html::parse_document(html).select(&WIKI_CONTENT).next().map(|content| content.html())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1089,5 +1106,17 @@ mod tests {
 		for sub in ["../comments", "a/b", "a?b", "r%2F"] {
 			assert!(search_path(Some(sub), "q", "", "", None).is_err(), "{sub}");
 		}
+	}
+
+	#[test]
+	fn test_parse_wiki() {
+		let html = r#"<html><body><div class="wiki-content"><html><head></head><body><div class="md wiki">
+<h2 id="wiki_title">Title</h2><p><a href="https://www.reddit.com/r/rust/wiki/faq">FAQ</a></p></div></body></html></div></body></html>"#;
+		let content = parse_wiki(html).unwrap();
+		assert!(content.starts_with(r#"<div class="md wiki">"#), "{content}");
+		assert!(content.contains(r#"<h2 id="wiki_title">Title</h2>"#), "{content}");
+		assert!(content.contains("/r/rust/wiki/faq"), "{content}");
+
+		assert_eq!(parse_wiki(r#"<html><body><h1>"index" does not exist</h1></body></html>"#), None);
 	}
 }
