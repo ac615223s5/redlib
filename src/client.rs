@@ -45,6 +45,11 @@ static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
 // renew it only once between them.
 static SHREDDIT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SHREDDIT_SESSION_RENEWAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+// Whether a session has been started and isn't running out of requests.
+// Reddit shows reCAPTCHA to every new session from an address that starts more
+// than a couple a minute, so requests aren't sent without one: that would
+// start a session Reddit refuses, on top of the renewal.
+static SHREDDIT_SESSION_STARTED: AtomicBool = AtomicBool::new(false);
 // Reddit refuses fragments to sessions that haven't passed the JavaScript
 // challenge on a page, so new sessions pass it here first. Any challenged page works.
 const SHREDDIT_SESSION_PAGE: &str = "/r/popular/";
@@ -305,7 +310,7 @@ pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<S
 		return Err(format!("Refusing to fetch non-shreddit path | {path}"));
 	}
 
-	let generation = SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst);
+	let generation = shreddit_session().await;
 	if let Some(body) = shreddit_request(&path, cursor.as_deref(), None, shreddit_redirect_target).await? {
 		return Ok(body);
 	}
@@ -324,7 +329,7 @@ pub async fn web_page(path: String) -> Result<String, String> {
 		return Err(format!("Refusing to fetch non-page path | {path}"));
 	}
 
-	let generation = SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst);
+	let generation = shreddit_session().await;
 	if let Some(body) = web_page_request(&path).await? {
 		return Ok(body);
 	}
@@ -333,6 +338,17 @@ pub async fn web_page(path: String) -> Result<String, String> {
 	web_page_request(&path)
 		.await?
 		.ok_or_else(|| format!("Reddit is rate limiting page requests. Try refreshing in a few seconds. | {path}"))
+}
+
+/// Starts a shreddit session if there is none or it is running out of
+/// requests, and returns the generation of the session to use.
+async fn shreddit_session() -> u64 {
+	let generation = SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst);
+	if SHREDDIT_SESSION_STARTED.load(Ordering::SeqCst) {
+		return generation;
+	}
+	renew_shreddit_session(generation).await;
+	SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Replaces the shreddit session Reddit refused or rate limited with a new one
@@ -351,6 +367,7 @@ async fn renew_shreddit_session(generation: u64) {
 		Ok(None) => warn!("Reddit challenged the new shreddit session again"),
 		Err(e) => warn!("Couldn't start a new shreddit session: {e}"),
 	}
+	SHREDDIT_SESSION_STARTED.store(true, Ordering::SeqCst);
 	SHREDDIT_SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -474,7 +491,7 @@ async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<Stri
 		.and_then(|value| value.parse::<f32>().ok());
 	if remaining.is_some_and(|remaining| remaining < SHREDDIT_RATELIMIT_ROTATE_BELOW) {
 		trace!("Shreddit session rate limit is low ({remaining:?} remaining), starting a new one");
-		SHREDDIT_SESSION.clear();
+		SHREDDIT_SESSION_STARTED.store(false, Ordering::SeqCst);
 	}
 
 	let body = response.text().await.map_err(|e| format!("Failed receiving body from Reddit: {e} | {path}"))?;
