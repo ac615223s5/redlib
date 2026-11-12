@@ -41,6 +41,13 @@ const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</tit
 // cookieless clients after about ten requests, but gives each session a budget
 // of a couple hundred requests. It is kept apart from the OAuth API requests on purpose.
 static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
+// Counts session renewals, so requests that were refused by the same session
+// renew it only once between them.
+static SHREDDIT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SHREDDIT_SESSION_RENEWAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+// Reddit refuses fragments to sessions that haven't passed the JavaScript
+// challenge on a page, so new sessions pass it here first. Any challenged page works.
+const SHREDDIT_SESSION_PAGE: &str = "/r/popular/";
 // Leaves room for the requests already in flight when the session is rotated.
 const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 const SHREDDIT_MAX_REDIRECTS: usize = 3;
@@ -119,9 +126,7 @@ pub fn build_client() -> WreqClient {
 pub fn rotate_client() {
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 	let last = CLIENT_ROTATED_AT.load(Ordering::SeqCst);
-	if now.saturating_sub(last) < CLIENT_ROTATE_COOLDOWN_SECS
-		|| CLIENT_ROTATED_AT.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err()
-	{
+	if now.saturating_sub(last) < CLIENT_ROTATE_COOLDOWN_SECS || CLIENT_ROTATED_AT.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
 	let index = (CLIENT_EMULATION.load(Ordering::SeqCst) + 1) % EMULATIONS.len();
@@ -300,15 +305,15 @@ pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<S
 		return Err(format!("Refusing to fetch non-shreddit path | {path}"));
 	}
 
+	let generation = SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst);
 	if let Some(body) = shreddit_request(&path, cursor.as_deref(), None, shreddit_redirect_target).await? {
 		return Ok(body);
 	}
 
-	warn!("Reddit rate limited the shreddit session, starting a new one");
-	SHREDDIT_SESSION.clear();
+	renew_shreddit_session(generation).await;
 	shreddit_request(&path, cursor.as_deref(), None, shreddit_redirect_target)
 		.await?
-		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
+		.ok_or_else(|| format!("Reddit is refusing or rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
 }
 
 /// Fetch a page of Reddit's web frontend as a logged-out visitor, for pages
@@ -319,15 +324,34 @@ pub async fn web_page(path: String) -> Result<String, String> {
 		return Err(format!("Refusing to fetch non-page path | {path}"));
 	}
 
+	let generation = SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst);
 	if let Some(body) = web_page_request(&path).await? {
 		return Ok(body);
 	}
 
-	warn!("Reddit rate limited or challenged the shreddit session, starting a new one");
-	SHREDDIT_SESSION.clear();
+	renew_shreddit_session(generation).await;
 	web_page_request(&path)
 		.await?
 		.ok_or_else(|| format!("Reddit is rate limiting page requests. Try refreshing in a few seconds. | {path}"))
+}
+
+/// Replaces the shreddit session Reddit refused or rate limited with a new one
+/// that has passed the JavaScript challenge. `generation` is the session's
+/// generation when it was refused; if it has been renewed since, nothing is done.
+async fn renew_shreddit_session(generation: u64) {
+	let _renewal = SHREDDIT_SESSION_RENEWAL.lock().await;
+	if SHREDDIT_SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+		return;
+	}
+
+	warn!("Reddit refused or rate limited the shreddit session, starting a new one");
+	SHREDDIT_SESSION.clear();
+	match web_page_request(SHREDDIT_SESSION_PAGE).await {
+		Ok(Some(_)) => {}
+		Ok(None) => warn!("Reddit challenged the new shreddit session again"),
+		Err(e) => warn!("Couldn't start a new shreddit session: {e}"),
+	}
+	SHREDDIT_SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Returns `Ok(None)` when Reddit rate limits or challenges the session.
@@ -434,7 +458,9 @@ async fn shreddit_send(path: &str, cursor: Option<&str>, referer: Option<&str>) 
 /// Returns `Ok(None)` when Reddit rate limits or challenges the session.
 async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<String>, String> {
 	let status = response.status();
-	if status == wreq::StatusCode::TOO_MANY_REQUESTS {
+	// Reddit answers sessions that haven't passed its JavaScript challenge with
+	// a bot-check redirect and then a 403.
+	if status == wreq::StatusCode::TOO_MANY_REQUESTS || status == wreq::StatusCode::FORBIDDEN {
 		return Ok(None);
 	}
 	if !status.is_success() {
