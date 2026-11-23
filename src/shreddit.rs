@@ -46,6 +46,14 @@ static MORE_COMMENTS: LazyLock<Selector> = LazyLock::new(|| Selector::parse("fac
 static CURSOR: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"input[name="cursor"]"#).unwrap());
 static COUNT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("faceplate-number[number]").unwrap());
 static PLAYER: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-player[src]").unwrap());
+/// An image in a comment, with Reddit's fixed-size layout and "Comment Image" alt text.
+static IMAGE_FIGURE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("figure.rte-media").unwrap());
+static IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img").unwrap());
+static LINK: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
+static FIGCAPTION: LazyLock<Selector> = LazyLock::new(|| Selector::parse("figcaption").unwrap());
+/// Telemetry wrappers around the words Reddit links to its own search.
+static SEARCH_TRACKER: LazyLock<Selector> = LazyLock::new(|| Selector::parse("search-telemetry-tracker").unwrap());
+static SEARCH_LINK: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"a[href^="/search/"]"#).unwrap());
 
 /// Fetch the comment tree of a post as a Reddit API comment `Listing`.
 ///
@@ -335,16 +343,74 @@ fn comment_content<'a>(element: ElementRef<'a>, id: &str) -> Option<ElementRef<'
 	)
 }
 
-/// The inner HTML of `content`, with Reddit's script-driven media players
-/// replaced by native videos so they render without Reddit's JavaScript.
+/// The inner HTML of `content` as the API rendered it: Reddit's script-driven
+/// media players become native videos, images lose Reddit's fixed-size layout,
+/// and the words Reddit links to its own search become plain text again.
 fn native_media_html(content: ElementRef<'_>) -> String {
-	content
-		.select(&PLAYER)
-		.fold(content.inner_html(), |html, player| html.replacen(&player.html(), &native_video(player), 1))
+	let mut html = content.inner_html();
+
+	// Trackers nest, so only the outermost one of each search term is replaced.
+	let is_nested = |tracker: &ElementRef<'_>| {
+		tracker
+			.ancestors()
+			.filter_map(ElementRef::wrap)
+			.any(|parent| parent.value().name() == "search-telemetry-tracker")
+	};
+	for tracker in content.select(&SEARCH_TRACKER).filter(|tracker| !is_nested(tracker)) {
+		let replacement = match tracker.select(&SEARCH_LINK).next() {
+			Some(link) => escape_text(link.text().collect::<String>().trim()),
+			None => tracker.inner_html(),
+		};
+		html = html.replacen(&tracker.html(), &replacement, 1);
+	}
+
+	// Figures around players are left for the players to be replaced in.
+	for figure in content.select(&IMAGE_FIGURE).filter(|figure| figure.select(&PLAYER).next().is_none()) {
+		if let Some(image) = native_image(figure) {
+			html = html.replacen(&figure.html(), &image, 1);
+		}
+	}
+
+	content.select(&PLAYER).fold(html, |html, player| html.replacen(&player.html(), &native_video(player), 1))
+}
+
+/// A comment image in the markup Redlib renders API comment images with.
+///
+/// Reddit's version is sized for its own layout and shows "Comment Image" as
+/// alt text in a fixed box until the lazily loaded image arrives.
+fn native_image(figure: ElementRef<'_>) -> Option<String> {
+	let image = figure.select(&IMAGE).next()?;
+	// The largest candidate: Reddit's `src` can be the full-size original.
+	let src = image
+		.value()
+		.attr("srcset")
+		.and_then(|srcset| srcset.split(',').filter_map(|candidate| candidate.split_whitespace().next()).next_back())
+		.or_else(|| image.value().attr("src"))?;
+	let href = figure.select(&LINK).next().and_then(|link| link.value().attr("href")).unwrap_or(src);
+	let caption = figure
+		.select(&FIGCAPTION)
+		.next()
+		.map(|caption| caption.text().collect::<String>().trim().to_string())
+		.filter(|caption| !caption.is_empty())
+		.map(|caption| format!("<figcaption>{}</figcaption>", escape_text(&caption)))
+		.unwrap_or_default();
+	Some(format!(
+		r#"<figure><a href="{}"><img loading="lazy" src="{}"></a>{caption}</figure>"#,
+		escape_attribute(href),
+		escape_attribute(src)
+	))
+}
+
+fn escape_attribute(value: &str) -> String {
+	value.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+fn escape_text(value: &str) -> String {
+	value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn native_video(player: ElementRef<'_>) -> String {
-	let src = player.value().attr("src").unwrap_or_default().replace('&', "&amp;").replace('"', "&quot;");
+	let src = escape_attribute(player.value().attr("src").unwrap_or_default());
 	// Reddit serves comment GIFs as silent MP4s that it autoplays in a loop.
 	let playback = if player.value().attr("gif").is_some() {
 		"autoplay loop muted playsinline"
@@ -798,6 +864,35 @@ mod tests {
 		assert_eq!(yara.data["body_html"], r#"<div class="md"><p>Outer only</p></div>"#);
 		assert_eq!(yara.data["distinguished"], "moderator");
 		assert_eq!(yara.data["stickied"], false, "uncollapsed moderator comments are not stickied");
+	}
+
+	#[test]
+	fn test_comment_images_and_search_terms_render_like_the_api() {
+		let fragment = parse_fragment(
+			r#"
+<shreddit-comment thingId="t1_i">
+  <div id="t1_i-comment-rtjson-content" slot="comment"><p>This is a <search-telemetry-tracker data-faceplate-tracking-context="{&quot;a&quot;:&quot;b>c&quot;}" view-events="post_detail/view/highlight"><search-telemetry-tracker click-events="search/click/full_search_button"><a class="border-dotted" href="/search/?q=White+Stork&amp;cId=1&amp;iId=2" rpl="">White Stork<span class="ms-2xs"><svg icon-name="search"><path d="m1 2"></path></svg></span></a></search-telemetry-tracker></search-telemetry-tracker>, see <a href="/search/?q=birds">search</a>.</p>
+    <figure class="rte-media">
+      <a class="w-fit" href="/preview/pre/bird-v0-x.jpeg?width=1439&amp;format=pjpg&amp;s=full" rel="noopener ugc" target="_blank">
+      <img alt="Comment Image" class="mb-0 max-w-[240px]" height="auto" loading="lazy" sizes="100vw" src="/preview/pre/bird-v0-x.jpeg?width=1439&amp;format=pjpg&amp;s=full" srcset="/preview/pre/bird-v0-x.jpeg?width=320&amp;s=a 1x, /preview/pre/bird-v0-x.jpeg?width=640&amp;s=b 2x" style="object-fit: cover;aspect-ratio:180/240" width="180">
+    </a>
+    </figure>
+  </div>
+</shreddit-comment>"#,
+		);
+		let html = fragment.comments[0].data["body_html"].as_str().unwrap();
+		assert!(html.contains("<p>This is a White Stork, see "), "search terms become plain text: {html}");
+		assert!(html.contains(r#"<a href="/search/?q=birds">search</a>"#), "links the commenter wrote are kept: {html}");
+		assert!(!html.contains("search-telemetry-tracker") && !html.contains("<svg"), "{html}");
+		assert!(
+			html.contains(r#"<figure><a href="/preview/pre/bird-v0-x.jpeg?width=1439&amp;format=pjpg&amp;s=full"><img loading="lazy" src="/preview/pre/bird-v0-x.jpeg?width=640&amp;s=b"></a></figure>"#),
+			"{html}"
+		);
+		assert!(!html.contains("Comment Image"), "{html}");
+		assert_eq!(
+			fragment.comments[0].data["body"].as_str().unwrap().split_whitespace().take(4).collect::<Vec<_>>(),
+			["This", "is", "a", "White"]
+		);
 	}
 
 	#[test]
