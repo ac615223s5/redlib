@@ -1059,12 +1059,12 @@ static REGEX_URL_NP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://np
 static REGEX_URL_PLAIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://reddit\.com/(.*)").unwrap());
 static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.*)/(DASH|CMAF)_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
 static REGEX_URL_VIDEOS_HLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$").unwrap());
-static REGEX_URL_IMAGES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://i\.redd\.it/(.*)").unwrap());
+static REGEX_URL_IMAGES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(?:cf\.)?i\.redd\.it/(.*)").unwrap());
 static REGEX_URL_THUMBS_A: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://a\.thumbs\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_THUMBS_B: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://b\.thumbs\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_EMOJI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://emoji\.redditmedia\.com/(.*)/(.*)").unwrap());
-static REGEX_URL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://preview\.redd\.it/(.*)").unwrap());
-static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://external\-preview\.redd\.it/(.*)").unwrap());
+static REGEX_URL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(?:cf\.)?preview\.redd\.it/(.*)").unwrap());
+static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(?:cf\.)?external\-preview\.redd\.it/(.*)").unwrap());
 static REGEX_URL_STYLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_STATIC_MEDIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
 static REGEX_URL_REDGIFS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(?:www\.|v\d+\.)?redgifs\.com/watch/([^?#]*)").unwrap());
@@ -1075,7 +1075,9 @@ pub fn format_url(url: &str) -> String {
 		String::new()
 	} else {
 		Url::parse(url).map_or(url.to_string(), |parsed| {
+			// Reddit also serves media from "cf."-prefixed aliases of its media hosts.
 			let domain = parsed.domain().unwrap_or_default();
+			let domain = domain.strip_prefix("cf.").filter(|host| host.ends_with(".redd.it")).unwrap_or(domain);
 
 			let capture = |regex: &Regex, format: &str, segments: i16| {
 				regex.captures(url).map_or(String::new(), |caps| match segments {
@@ -1143,7 +1145,7 @@ pub fn render_bullet_lists(input_text: &str) -> String {
 
 // These are links we want to replace in-body
 static REDDIT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|)(reddit\.com|redd\.it)/"#).unwrap());
-static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)").unwrap());
+static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(?:cf\.)?(external-preview|preview|i)\.redd\.it(.*)").unwrap());
 static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://(?:www\.)?redditstatic\.com/[^\s"'<>]*"#).unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
@@ -1552,6 +1554,14 @@ mod tests {
 		assert_eq!(
 			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
 			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
+		);
+		assert_eq!(format_url("https://cf.preview.redd.it/qwerty.jpg?width=640&s=asdf"), "/preview/pre/qwerty.jpg?width=640&s=asdf");
+		assert_eq!(format_url("https://cf.external-preview.redd.it/qwerty.gif?s=asdf"), "/preview/external-pre/qwerty.gif?s=asdf");
+		assert_eq!(format_url("https://cf.i.redd.it/foobar.jpg"), "/img/foobar.jpg");
+		assert_eq!(format_url("https://cf.example.com/foobar.jpg"), "https://cf.example.com/foobar.jpg");
+		assert_eq!(
+			rewrite_urls(r#"<figure><a href="https://cf.preview.redd.it/a.jpeg?width=684&amp;s=1"><img loading="lazy" src="https://cf.preview.redd.it/a.jpeg?width=640&amp;s=2"></a></figure>"#),
+			r#"<figure><a href="/preview/pre/a.jpeg?width=684&amp;s=1"><img loading="lazy" src="/preview/pre/a.jpeg?width=640&amp;s=2"></a></figure>"#
 		);
 		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/dash/360.mp4");
 		assert_eq!(format_url("https://v.redd.it/foo/CMAF_720.mp4?source=fallback"), "/vid/foo/cmaf/720.mp4");

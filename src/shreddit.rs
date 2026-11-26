@@ -7,6 +7,7 @@
 //! rendering stay unchanged.
 
 use crate::client::{shreddit_fragment, web_page};
+use crate::utils::format_url;
 use cached::proc_macro::cached;
 use chrono::DateTime;
 use log::warn;
@@ -396,8 +397,8 @@ fn native_image(figure: ElementRef<'_>) -> Option<String> {
 		.unwrap_or_default();
 	Some(format!(
 		r#"<figure><a href="{}"><img loading="lazy" src="{}"></a>{caption}</figure>"#,
-		escape_attribute(href),
-		escape_attribute(src)
+		escape_attribute(&format_url(href)),
+		escape_attribute(&format_url(src))
 	))
 }
 
@@ -410,7 +411,11 @@ fn escape_text(value: &str) -> String {
 }
 
 fn native_video(player: ElementRef<'_>) -> String {
-	let src = escape_attribute(player.value().attr("src").unwrap_or_default());
+	let src = player.value().attr("src").unwrap_or_default();
+	if let Some(asset) = hls_asset(src) {
+		return native_hls_video(asset, player.value().attr("poster"));
+	}
+	let src = escape_attribute(src);
 	// Reddit serves comment GIFs as silent MP4s that it autoplays in a loop.
 	let playback = if player.value().attr("gif").is_some() {
 		"autoplay loop muted playsinline"
@@ -418,6 +423,36 @@ fn native_video(player: ElementRef<'_>) -> String {
 		"controls preload=\"metadata\""
 	};
 	format!(r#"<video src="{src}" {playback}></video>"#)
+}
+
+/// Video sizes v.redd.it may have as MP4s, largest first.
+const VIDEO_SIZES: [u16; 6] = [1080, 720, 480, 360, 270, 220];
+
+/// The v.redd.it asset ID of an HLS playlist URL, such as
+/// `https://v.redd.it/link/<post>/asset/<asset>/HLSPlaylist.m3u8?...` used for comment videos.
+fn hls_asset(src: &str) -> Option<&str> {
+	let path = src.strip_prefix("https://v.redd.it/")?.split('?').next()?;
+	let asset = path.strip_suffix("/HLSPlaylist.m3u8")?.rsplit('/').next()?;
+	(!asset.is_empty() && asset.chars().all(|c| c.is_ascii_alphanumeric())).then_some(asset)
+}
+
+/// A comment video playable without Reddit's player, through Redlib's proxy.
+///
+/// Browsers can't play HLS without hls.js, so the playlist is followed by the
+/// MP4 sizes v.redd.it may have (video only, as for posts without HLS). The
+/// browser skips sources it can't play or that don't exist, and with
+/// `preload="none"` fetches nothing until the video is played.
+fn native_hls_video(asset: &str, poster: Option<&str>) -> String {
+	let poster = poster
+		.map(format_url)
+		.filter(|poster| poster.starts_with('/'))
+		.map(|poster| format!(r#" poster="{}""#, escape_attribute(&poster)))
+		.unwrap_or_default();
+	let mp4s: String = VIDEO_SIZES
+		.iter()
+		.map(|size| format!(r#"<source src="/vid/{asset}/cmaf/{size}.mp4" type="video/mp4">"#))
+		.collect();
+	format!(r#"<video controls preload="none"{poster}><source src="/hls/{asset}/HLSPlaylist.m3u8" type="application/vnd.apple.mpegurl">{mp4s}</video>"#)
 }
 
 fn edited_time(element: ElementRef<'_>) -> Option<f64> {
@@ -893,6 +928,27 @@ mod tests {
 			fragment.comments[0].data["body"].as_str().unwrap().split_whitespace().take(4).collect::<Vec<_>>(),
 			["This", "is", "a", "White"]
 		);
+	}
+
+	#[test]
+	fn test_hls_comment_videos_play_through_the_proxy() {
+		let fragment = parse_fragment(
+			r#"
+<shreddit-comment thingId="t1_v">
+  <div id="t1_v-comment-rtjson-content" slot="comment"><p>Look</p><shreddit-async-loader bundlename="shreddit_player_loader">
+    <shreddit-player player-type="comment_player" poster="https://preview.redd.it/7iyxlb2neo2i1.jpg?vthumb=1&amp;s=f6" src="https://v.redd.it/link/1y0mxo0/asset/7iyxlb2neo2i1/HLSPlaylist.m3u8?f=sd%2CsubsAll&amp;v=1&amp;a=17%2CZWV%3D"></shreddit-player>
+  </shreddit-async-loader></div>
+</shreddit-comment>"#,
+		);
+		let html = fragment.comments[0].data["body_html"].as_str().unwrap();
+		assert!(html.contains(r#"<video controls preload="none" poster="/preview/pre/7iyxlb2neo2i1.jpg?vthumb=1&amp;s=f6"><source src="/hls/7iyxlb2neo2i1/HLSPlaylist.m3u8" type="application/vnd.apple.mpegurl"><source src="/vid/7iyxlb2neo2i1/cmaf/1080.mp4" type="video/mp4">"#), "{html}");
+		assert!(html.contains(r#"<source src="/vid/7iyxlb2neo2i1/cmaf/220.mp4" type="video/mp4"></video>"#), "{html}");
+		assert!(!html.contains("v.redd.it"), "{html}");
+
+		assert_eq!(hls_asset("https://v.redd.it/abc123/HLSPlaylist.m3u8"), Some("abc123"));
+		assert_eq!(hls_asset("https://v.redd.it/link/1/asset/../HLSPlaylist.m3u8"), None);
+		assert_eq!(hls_asset("https://v.redd.it/abc123/DASH_480.mp4"), None);
+		assert_eq!(hls_asset("https://evil.example/abc123/HLSPlaylist.m3u8"), None);
 	}
 
 	#[test]
