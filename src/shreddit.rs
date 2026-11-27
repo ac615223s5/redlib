@@ -707,7 +707,13 @@ static FEED_SIZED_IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("
 static FEED_GALLERY_PAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("gallery-carousel li").unwrap());
 static FEED_THUMBNAIL: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"img[src*="preview.redd.it/"]"#).unwrap());
 /// The lazily loaded next page of the feed.
-static FEED_NEXT: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="community-more-posts/"][src*="after="]"#).unwrap());
+static FEED_NEXT: LazyLock<Selector> =
+	LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="community-more-posts/"][src*="after="], faceplate-partial[src*="/feeds/popular-feed?"][src*="after="]"#).unwrap());
+/// Posts per page of the API's listings.
+const FEED_PAGE_SIZE: usize = 24;
+/// Fragments fetched at most for one page of r/popular. Its first fragment
+/// only has a few posts: the page itself carries the rest.
+const POPULAR_FRAGMENTS_PER_PAGE: usize = 3;
 
 /// Whether subreddit listings sorted by `sort` have to come from the web
 /// frontend: Reddit's API answers them with a 403 for anonymous clients.
@@ -723,13 +729,38 @@ pub async fn subreddit_feed(subreddit: String, sort: String, after: Option<Strin
 	if subreddit.is_empty() || !subreddit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !is_feed_sort(&sort) {
 		return Err(format!("Invalid subreddit feed | {subreddit}/{sort}"));
 	}
-	let mut path = format!("/svc/shreddit/community-more-posts/{sort}/?name={subreddit}");
-	if let Some(after) = after.filter(|after| !after.is_empty()) {
-		// The frontend's cursor is the base64 of the API's.
-		let cursor = base64::engine::general_purpose::STANDARD.encode(after);
-		path.push_str(&format!("&after={}", form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>()));
-	}
+	let path = format!("/svc/shreddit/community-more-posts/{sort}/?name={subreddit}{}", feed_cursor(after.as_deref()));
 	Ok(parse_feed_fragment(&shreddit_fragment(path, None).await?))
+}
+
+/// r/popular sorted by `sort` as a Reddit API `Listing`, from the web
+/// frontend's popular feed. `after` is the API's cursor.
+#[cached(size = 100, time = 30, result = true)]
+pub async fn popular_feed(sort: String, after: Option<String>) -> Result<Value, String> {
+	if !is_feed_sort(&sort) {
+		return Err(format!("Invalid popular feed | {sort}"));
+	}
+	let (mut posts, mut seen, mut after) = (Vec::new(), HashSet::new(), after.filter(|after| !after.is_empty()));
+	for _ in 0..POPULAR_FRAGMENTS_PER_PAGE {
+		let path = format!("/svc/shreddit/feeds/popular-feed?sort={}{}", sort.to_uppercase(), feed_cursor(after.as_deref()));
+		let page = parse_feed_fragment(&shreddit_fragment(path, None).await?);
+		let children = page["data"]["children"].as_array().cloned().unwrap_or_default();
+		posts.extend(children.into_iter().filter(|post| seen.insert(post["data"]["id"].as_str().unwrap_or_default().to_string())));
+		after = page["data"]["after"].as_str().filter(|after| !after.is_empty()).map(str::to_string);
+		if after.is_none() || posts.len() >= FEED_PAGE_SIZE {
+			break;
+		}
+	}
+	Ok(json!({ "kind": "Listing", "data": { "after": after.unwrap_or_default(), "children": posts } }))
+}
+
+/// The `after` query parameter of a feed fragment for the API's cursor: the
+/// frontend's cursor is the base64 of the API's.
+fn feed_cursor(after: Option<&str>) -> String {
+	after.filter(|after| !after.is_empty()).map_or_else(String::new, |after| {
+		let cursor = base64::engine::general_purpose::STANDARD.encode(after);
+		format!("&after={}", form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>())
+	})
 }
 
 fn parse_feed_fragment(html: &str) -> Value {
@@ -886,6 +917,91 @@ fn feed_video(element: ElementRef<'_>, content_href: &str) -> Option<Value> {
 		"height": height,
 		"poster": player.value().attr("poster").unwrap_or_default(),
 	}))
+}
+
+// MULTIREDDITS
+
+/// A post in the listings of Reddit's old design, which reddit.com still uses
+/// for multireddits. Promoted posts are ads.
+static OLD_POST: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"div.thing[data-fullname^="t3_"]:not([data-promoted="true"])"#).unwrap());
+static OLD_TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a.title").unwrap());
+static OLD_FLAIR: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".linkflairlabel[title]").unwrap());
+static OLD_NEXT: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".next-button a[href]").unwrap());
+
+/// The newest posts of the multireddit `subreddits` (names joined by "+") as a
+/// Reddit API `Listing`, from the old-design page reddit.com serves for it.
+///
+/// That page has no post text or thumbnails for logged-out visitors, so posts
+/// show their title, and only images hosted on Reddit are shown as media.
+#[cached(size = 100, time = 30, result = true)]
+pub async fn multireddit_new(subreddits: String, after: Option<String>) -> Result<Value, String> {
+	if subreddits.split('+').any(|name| name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+		return Err(format!("Invalid multireddit | {subreddits}"));
+	}
+	let mut path = format!("/r/{subreddits}/new/");
+	if let Some(after) = after.filter(|after| after.starts_with("t3_") && after.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+		path.push_str(&format!("?count=25&after={after}"));
+	}
+	Ok(parse_old_listing(&web_page(path).await?))
+}
+
+fn parse_old_listing(html: &str) -> Value {
+	let document = Html::parse_document(html);
+	let posts: Vec<Value> = document.select(&OLD_POST).filter_map(parse_old_post).collect();
+	let after = document
+		.select(&OLD_NEXT)
+		.find_map(|next| query_param(next.value().attr("href")?, "after"))
+		.filter(|after| after.starts_with("t3_"))
+		.unwrap_or_default();
+	json!({ "kind": "Listing", "data": { "after": after, "children": posts } })
+}
+
+/// A post of an old-design listing as the API's `t3` post.
+fn parse_old_post(element: ElementRef<'_>) -> Option<Value> {
+	let attr = |name: &str| element.value().attr(name);
+	let id = attr("data-fullname")?.strip_prefix("t3_")?;
+	let permalink = attr("data-permalink")?;
+	let domain = attr("data-domain").unwrap_or_default();
+	let classes: Vec<&str> = element.value().classes().collect();
+	let is_self = classes.contains(&"self") || domain.starts_with("self.");
+	let flair = element.select(&OLD_FLAIR).next();
+	let flair_color = flair
+		.and_then(|flair| flair.value().attr("style")?.split(';').find_map(|rule| rule.trim().strip_prefix("background-color:")).map(str::trim))
+		.unwrap_or_default();
+
+	// Videos and galleries need data this page doesn't have, so they link to the post.
+	let url = if domain == "v.redd.it" || attr("data-is-gallery") == Some("true") {
+		permalink
+	} else {
+		attr("data-url").unwrap_or(permalink)
+	};
+	let mut post = json!({
+		"id": id,
+		"name": format!("t3_{id}"),
+		"title": element.select(&OLD_TITLE).next().map(|title| title.text().collect::<String>()).unwrap_or_default(),
+		"subreddit": attr("data-subreddit").unwrap_or_default(),
+		"author": attr("data-author").unwrap_or("[deleted]"),
+		"permalink": permalink,
+		"url": url,
+		"domain": domain,
+		"score": attr("data-score").and_then(|score| score.parse::<i64>().ok()).unwrap_or_default(),
+		"num_comments": attr("data-comments-count").and_then(|count| count.parse::<i64>().ok()).unwrap_or_default(),
+		"created_utc": attr("data-timestamp").and_then(|time| time.parse::<f64>().ok()).map_or(0.0, |time| time / 1000.0),
+		"stickied": classes.contains(&"stickied"),
+		"over_18": attr("data-nsfw") == Some("true"),
+		"spoiler": attr("data-spoiler") == Some("true"),
+		"link_flair_type": "text",
+		"link_flair_text": flair.and_then(|flair| flair.value().attr("title")).unwrap_or_default(),
+		"link_flair_background_color": flair_color,
+		"link_flair_text_color": if flair.is_some_and(|flair| flair.value().classes().any(|class| class == "flaircolordark")) { "dark" } else { "light" },
+		"is_self": is_self,
+	});
+	if domain == "i.redd.it" {
+		let data = post.as_object_mut()?;
+		data.insert("post_hint".into(), "image".into());
+		data.insert("preview".into(), json!({ "images": [{ "source": { "url": url, "width": 0, "height": 0 } }] }));
+	}
+	Some(json!({ "kind": "t3", "data": post }))
 }
 
 // WIKI
@@ -1529,6 +1645,52 @@ mod tests {
 		assert_eq!((link["thumbnail_width"].as_i64(), link["thumbnail_height"].as_i64()), (Some(140), Some(73)));
 
 		assert_eq!(parse_feed_fragment("<div>No posts</div>")["data"], json!({ "after": "", "children": [] }));
+	}
+
+	#[test]
+	fn test_parse_old_listing() {
+		let html = r#"<div id="siteTable">
+<div class=" thing id-t3_img linkflair odd link " data-fullname="t3_img" data-is-gallery="false" data-author="AshR75" data-subreddit="linux" data-timestamp="1795786834000" data-url="https://i.redd.it/eh62s0n8q54i1.gif" data-permalink="/r/linux/comments/img/t/" data-domain="i.redd.it" data-comments-count="3" data-score="19" data-promoted="false" data-nsfw="false" data-spoiler="true"><div class="entry"><p class="title"><a class="title may-blank outbound" href="https://i.redd.it/eh62s0n8q54i1.gif">Audio &amp; visualizer</a><span class="flairrichtext flaircolorlight linkflairlabel " title="Fluff" style="background-color: #9a2bff; border-color: #9a2bff;"><span>Fluff</span></span></p></div></div>
+<div class=" thing id-t3_ad promoted link " data-fullname="t3_ad" data-permalink="/r/ad/" data-promoted="true"></div>
+<div class=" thing id-t3_self stickied link self" data-fullname="t3_self" data-is-gallery="false" data-author="bob" data-subreddit="rust" data-timestamp="1795796569000" data-url="/r/rust/comments/self/t/" data-permalink="/r/rust/comments/self/t/" data-domain="self.rust" data-comments-count="2" data-score="1" data-promoted="false" data-nsfw="true"><a class="title" href="/r/rust/comments/self/t/">Self</a><span class="linkflairlabel flaircolordark" title="discussion" style="background-color: #f2f2f2;"></span></div>
+<div class=" thing id-t3_vid link " data-fullname="t3_vid" data-is-gallery="false" data-author="carol" data-subreddit="rust" data-timestamp="1795796000000" data-url="https://v.redd.it/abc" data-permalink="/r/rust/comments/vid/t/" data-domain="v.redd.it" data-promoted="false"><a class="title" href="https://v.redd.it/abc">Vid</a></div>
+<div class=" thing id-t3_link link " data-fullname="t3_link" data-is-gallery="false" data-subreddit="rust" data-timestamp="1795795000000" data-url="https://example.com/a" data-permalink="/r/rust/comments/link/t/" data-domain="example.com" data-promoted="false"><a class="title" href="https://example.com/a">Link</a></div>
+</div>
+<div class="nav-buttons"><span class="next-button"><a href="https://www.reddit.com/r/linux+rust/new/?count=25&amp;after=t3_link" rel="nofollow next">next</a></span></div>"#;
+		let listing = parse_old_listing(html);
+		assert_eq!(listing["data"]["after"], "t3_link");
+		let posts: Vec<&Value> = listing["data"]["children"].as_array().unwrap().iter().map(|post| &post["data"]).collect();
+		assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["img", "self", "vid", "link"]);
+
+		let image = posts[0];
+		assert_eq!(image["title"], "Audio & visualizer");
+		assert_eq!(image["subreddit"], "linux");
+		assert_eq!(image["author"], "AshR75");
+		assert_eq!(image["created_utc"], 1795786834.0);
+		assert_eq!((image["score"].as_i64(), image["num_comments"].as_i64()), (Some(19), Some(3)));
+		assert_eq!((image["spoiler"].as_bool(), image["over_18"].as_bool()), (Some(true), Some(false)));
+		assert_eq!(image["post_hint"], "image");
+		assert_eq!(image["url"], "https://i.redd.it/eh62s0n8q54i1.gif");
+		assert_eq!((image["link_flair_text"].as_str(), image["link_flair_background_color"].as_str()), (Some("Fluff"), Some("#9a2bff")));
+
+		let text = posts[1];
+		assert_eq!((text["is_self"].as_bool(), text["stickied"].as_bool(), text["over_18"].as_bool()), (Some(true), Some(true), Some(true)));
+		assert_eq!(text["link_flair_text_color"], "dark");
+		assert_eq!(text["author"], "bob");
+
+		assert_eq!(posts[2]["url"], "/r/rust/comments/vid/t/", "videos link to their post");
+		assert_eq!(posts[3]["url"], "https://example.com/a");
+		assert_eq!(posts[3]["author"], "[deleted]");
+		assert!(posts[3].get("post_hint").is_none());
+	}
+
+	#[test]
+	fn test_feed_cursor() {
+		assert_eq!(feed_cursor(None), "");
+		assert_eq!(feed_cursor(Some("")), "");
+		assert_eq!(feed_cursor(Some("t3_link")), "&after=dDNfbGluaw%3D%3D");
+		let next = parse_feed_fragment(r#"<faceplate-partial src="/svc/shreddit/feeds/popular-feed?after=dDNfbGluaw%3D%3D&amp;sort=NEW"></faceplate-partial>"#);
+		assert_eq!(next["data"]["after"], "t3_link");
 	}
 
 	#[test]

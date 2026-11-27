@@ -101,13 +101,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		return info(req, "Reddit now requires a login to view r/all, so Redlib can't show it. r/popular is still available.").await;
 	}
 
-	// The web frontend's feed, which replaces these sorts, only covers one subreddit.
-	if shreddit::is_feed_sort(&sort) && (sub_name.contains('+') || sub_name == "popular") {
-		return info(
-			req,
-			&format!("Reddit no longer lets Redlib sort multireddits or r/popular by {sort}. Open one subreddit at a time, or pick another sort."),
-		)
-		.await;
+	// reddit.com only shows logged-out visitors multireddits sorted by new.
+	if sort == "rising" && sub_name.contains('+') {
+		return info(req, "Reddit no longer shows multireddits sorted by rising without a login. Open one subreddit at a time, or pick another sort.").await;
 	}
 
 	let quarantined = can_access_quarantine(&req, &sub_name) || root;
@@ -215,12 +211,22 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 /// Reddit's API refuses some sorts of single subreddits to anonymous clients,
 /// so those come from the web frontend's feed instead.
 async fn fetch_posts(sub: &str, sort: &str, path: &str, quarantined: bool) -> Result<(Vec<Post>, String), String> {
-	if !shreddit::is_feed_sort(sort) || sub.contains('+') || matches!(sub, "popular" | "all") {
+	// reddit.com only shows logged-out visitors multireddits sorted by new.
+	if !shreddit::is_feed_sort(sort) || sub == "all" || (sub.contains('+') && sort != "new") {
 		return Post::fetch(path, quarantined).await;
 	}
-	// The feed doesn't say why a subreddit is unavailable, but the API still does.
-	json(format!("/r/{sub}/about.json?raw_json=1"), quarantined).await?;
-	Post::from_listing(&shreddit::subreddit_feed(sub.to_string(), sort.to_string(), param(path, "after")).await?).await
+	let after = param(path, "after");
+	// Like reddit.com, which loads each of these differently.
+	let listing = if sub == "popular" {
+		shreddit::popular_feed(sort.to_string(), after).await?
+	} else if sub.contains('+') {
+		shreddit::multireddit_new(sub.to_string(), after).await?
+	} else {
+		// The feed doesn't say why a subreddit is unavailable, but the API still does.
+		json(format!("/r/{sub}/about.json?raw_json=1"), quarantined).await?;
+		shreddit::subreddit_feed(sub.to_string(), sort.to_string(), after).await?
+	};
+	Post::from_listing(&listing).await
 }
 
 pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Response<Body> {
