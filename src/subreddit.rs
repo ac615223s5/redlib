@@ -101,6 +101,15 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		return info(req, "Reddit now requires a login to view r/all, so Redlib can't show it. r/popular is still available.").await;
 	}
 
+	// The web frontend's feed, which replaces these sorts, only covers one subreddit.
+	if shreddit::is_feed_sort(&sort) && (sub_name.contains('+') || sub_name == "popular") {
+		return info(
+			req,
+			&format!("Reddit no longer lets Redlib sort multireddits or r/popular by {sort}. Open one subreddit at a time, or pick another sort."),
+		)
+		.await;
+	}
+
 	let quarantined = can_access_quarantine(&req, &sub_name) || root;
 
 	// Handle random subreddits
@@ -168,7 +177,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			no_posts: false,
 		}))
 	} else {
-		match Post::fetch(&path, quarantined).await {
+		match fetch_posts(&sub_name, &sort, &path, quarantined).await {
 			Ok((mut posts, after)) => {
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
@@ -199,6 +208,19 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			},
 		}
 	}
+}
+
+/// The posts of the subreddit listing at `path` (`/r/{sub}/{sort}.json?...`).
+///
+/// Reddit's API refuses some sorts of single subreddits to anonymous clients,
+/// so those come from the web frontend's feed instead.
+async fn fetch_posts(sub: &str, sort: &str, path: &str, quarantined: bool) -> Result<(Vec<Post>, String), String> {
+	if !shreddit::is_feed_sort(sort) || sub.contains('+') || matches!(sub, "popular" | "all") {
+		return Post::fetch(path, quarantined).await;
+	}
+	// The feed doesn't say why a subreddit is unavailable, but the API still does.
+	json(format!("/r/{sub}/about.json?raw_json=1"), quarantined).await?;
+	Post::from_listing(&shreddit::subreddit_feed(sub.to_string(), sort.to_string(), param(path, "after")).await?).await
 }
 
 pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Response<Body> {
@@ -623,7 +645,7 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subreddit = subreddit(&sub, false).await?;
 
 	// Get posts
-	let (posts, _) = Post::fetch(&path, false).await?;
+	let (posts, _) = fetch_posts(&sub, &sort, &path, false).await?;
 
 	// Build the RSS feed
 	let channel = ChannelBuilder::default()

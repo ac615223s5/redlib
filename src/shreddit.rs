@@ -8,6 +8,7 @@
 
 use crate::client::{shreddit_fragment, web_page};
 use crate::utils::format_url;
+use base64::Engine as _;
 use cached::proc_macro::cached;
 use chrono::DateTime;
 use log::warn;
@@ -55,6 +56,8 @@ static FIGCAPTION: LazyLock<Selector> = LazyLock::new(|| Selector::parse("figcap
 /// Telemetry wrappers around the words Reddit links to its own search.
 static SEARCH_TRACKER: LazyLock<Selector> = LazyLock::new(|| Selector::parse("search-telemetry-tracker").unwrap());
 static SEARCH_LINK: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"a[href^="/search/"]"#).unwrap());
+/// A word Reddit linked to its own search; links commenters write have no `cId`.
+static SEARCH_TERM_LINK: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"a[href^="/search/"][href*="cId="]"#).unwrap());
 
 /// Fetch the comment tree of a post as a Reddit API comment `Listing`.
 ///
@@ -363,6 +366,11 @@ fn native_media_html(content: ElementRef<'_>) -> String {
 			None => tracker.inner_html(),
 		};
 		html = html.replacen(&tracker.html(), &replacement, 1);
+	}
+	// The parser moves links nested in another link, like the ones in feed
+	// previews, out of their tracker.
+	for link in content.select(&SEARCH_TERM_LINK) {
+		html = html.replacen(&link.html(), &escape_text(link.text().collect::<String>().trim()), 1);
 	}
 
 	// Figures around players are left for the players to be replaced in.
@@ -684,6 +692,200 @@ fn parse_search_post(element: ElementRef<'_>) -> Option<Value> {
 fn query_param(url: &str, name: &str) -> Option<String> {
 	let url = Url::parse(url).or_else(|_| Url::parse("https://www.reddit.com")?.join(url)).ok()?;
 	url.query_pairs().find(|(key, _)| key == name).map(|(_, value)| value.into_owned())
+}
+
+// SUBREDDIT FEEDS
+
+/// A post card; ads are `shreddit-ad-post` elements and don't match.
+static FEED_POST: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-post[id][permalink]").unwrap());
+static FEED_TEXT_BODY: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"shreddit-post-text-body [property="schema:articleBody"]"#).unwrap());
+static FEED_FLAIR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-post-flair .flair-content").unwrap());
+static FEED_FLAIR_COLOR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-post-flair [style]").unwrap());
+static FEED_PRIMARY_IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[data-post-media-primary][width][height]").unwrap());
+static FEED_FULL_IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"img[src^="https://i.redd.it/"]"#).unwrap());
+static FEED_SIZED_IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[width][height]").unwrap());
+static FEED_GALLERY_PAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("gallery-carousel li").unwrap());
+static FEED_THUMBNAIL: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"img[src*="preview.redd.it/"]"#).unwrap());
+/// The lazily loaded next page of the feed.
+static FEED_NEXT: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="community-more-posts/"][src*="after="]"#).unwrap());
+
+/// Whether subreddit listings sorted by `sort` have to come from the web
+/// frontend: Reddit's API answers them with a 403 for anonymous clients.
+pub fn is_feed_sort(sort: &str) -> bool {
+	matches!(sort, "new" | "rising")
+}
+
+/// A subreddit's posts sorted by `sort` as a Reddit API `Listing`, from the
+/// web frontend's feed. `after` is the API's cursor: the fullname of the last
+/// post of the previous page.
+#[cached(size = 100, time = 30, result = true)]
+pub async fn subreddit_feed(subreddit: String, sort: String, after: Option<String>) -> Result<Value, String> {
+	if subreddit.is_empty() || !subreddit.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !is_feed_sort(&sort) {
+		return Err(format!("Invalid subreddit feed | {subreddit}/{sort}"));
+	}
+	let mut path = format!("/svc/shreddit/community-more-posts/{sort}/?name={subreddit}");
+	if let Some(after) = after.filter(|after| !after.is_empty()) {
+		// The frontend's cursor is the base64 of the API's.
+		let cursor = base64::engine::general_purpose::STANDARD.encode(after);
+		path.push_str(&format!("&after={}", form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>()));
+	}
+	Ok(parse_feed_fragment(&shreddit_fragment(path, None).await?))
+}
+
+fn parse_feed_fragment(html: &str) -> Value {
+	let document = Html::parse_document(html);
+	let posts: Vec<Value> = document.select(&FEED_POST).filter_map(parse_feed_post).collect();
+	let after = document
+		.select(&FEED_NEXT)
+		.find_map(|next| query_param(next.value().attr("src")?, "after"))
+		.and_then(|cursor| base64::engine::general_purpose::STANDARD.decode(cursor).ok())
+		.and_then(|cursor| String::from_utf8(cursor).ok())
+		.filter(|cursor| cursor.starts_with("t3_"))
+		.unwrap_or_default();
+	json!({ "kind": "Listing", "data": { "after": after, "children": posts } })
+}
+
+/// A post card as the API's `t3` post, with what Redlib renders of it.
+fn parse_feed_post(element: ElementRef<'_>) -> Option<Value> {
+	let attr = |name: &str| element.value().attr(name);
+	let id = attr("id")?.strip_prefix("t3_")?;
+	let permalink = attr("permalink")?;
+	let post_type = attr("post-type").unwrap_or("text");
+	let content_href = attr("content-href").unwrap_or(permalink);
+	let subreddit = attr("subreddit-prefixed-name")
+		.and_then(|name| name.strip_prefix("r/"))
+		.or_else(|| permalink.strip_prefix("/r/")?.split('/').next())
+		.unwrap_or_default();
+	let author = if attr("is-author-deleted").is_some() { "[deleted]" } else { attr("author").unwrap_or("[deleted]") };
+
+	let flair = element.select(&FEED_FLAIR).next().map(|flair| flair.text().collect::<String>().trim().to_string()).unwrap_or_default();
+	let flair_color = element
+		.select(&FEED_FLAIR_COLOR)
+		.find_map(|styled| styled.value().attr("style")?.split(';').find_map(|rule| rule.trim().strip_prefix("background-color:")).map(str::trim))
+		.unwrap_or_default();
+
+	let mut post = json!({
+		"id": id,
+		"name": format!("t3_{id}"),
+		"title": attr("post-title").unwrap_or_default(),
+		"subreddit": subreddit,
+		"author": author,
+		"permalink": permalink,
+		"url": content_href,
+		"domain": attr("domain").unwrap_or_default(),
+		"score": attr("score").and_then(|score| score.parse::<i64>().ok()).unwrap_or_default(),
+		"upvote_ratio": attr("upvote-ratio").and_then(|ratio| ratio.parse::<f64>().ok()).unwrap_or(1.0),
+		"num_comments": attr("comment-count").and_then(|count| count.parse::<i64>().ok()).unwrap_or_default(),
+		"created_utc": attr("created-timestamp").and_then(unix_time).unwrap_or_default(),
+		"stickied": attr("stickied").is_some() || attr("pinned").is_some(),
+		"over_18": attr("nsfw").is_some(),
+		"spoiler": attr("spoiler").is_some(),
+		"link_flair_type": "text",
+		"link_flair_text": flair,
+		"link_flair_background_color": flair_color,
+		"link_flair_text_color": "light",
+		"is_self": false,
+	});
+	let data = post.as_object_mut()?;
+
+	let size = |image: ElementRef<'_>, name: &str| image.value().attr(name).and_then(|size| size.parse::<i64>().ok()).unwrap_or_default();
+	match post_type {
+		"text" | "multi_media" => {
+			let body = element.select(&FEED_TEXT_BODY).next().map(native_media_html).unwrap_or_default();
+			data.insert("is_self".into(), true.into());
+			data.insert("url".into(), permalink.into());
+			data.insert("selftext_html".into(), (if body.trim().is_empty() { String::new() } else { format!("<div class=\"md\">{body}</div>") }).into());
+		}
+		"image" => {
+			let primary = element.select(&FEED_PRIMARY_IMAGE).next();
+			let full = if content_href.starts_with("https://i.redd.it/") {
+				Some(content_href)
+			} else {
+				element.select(&FEED_FULL_IMAGE).next().and_then(|image| image.value().attr("src"))
+			};
+			let source = full.or_else(|| primary.and_then(|image| image.value().attr("src"))).unwrap_or_default();
+			data.insert("post_hint".into(), "image".into());
+			data.insert("url".into(), source.into());
+			data.insert(
+				"preview".into(),
+				json!({ "images": [{ "source": { "url": source, "width": primary.map_or(0, |image| size(image, "width")), "height": primary.map_or(0, |image| size(image, "height")) } }] }),
+			);
+		}
+		"gallery" => {
+			let (mut items, mut metadata) = (Vec::new(), serde_json::Map::new());
+			for (index, page) in element.select(&FEED_GALLERY_PAGE).enumerate() {
+				let Some(url) = page.select(&FEED_FULL_IMAGE).next().and_then(|image| image.value().attr("src")) else {
+					continue;
+				};
+				let sized = page.select(&FEED_SIZED_IMAGE).next();
+				let media_id = format!("i{index}");
+				metadata.insert(
+					media_id.clone(),
+					json!({ "m": "image/jpeg", "s": { "u": url, "x": sized.map_or(0, |image| size(image, "width")), "y": sized.map_or(0, |image| size(image, "height")) } }),
+				);
+				items.push(json!({ "media_id": media_id }));
+			}
+			if !items.is_empty() {
+				data.insert("is_gallery".into(), true.into());
+				data.insert("url".into(), permalink.into());
+				data.insert("gallery_data".into(), json!({ "items": items }));
+				data.insert("media_metadata".into(), Value::Object(metadata));
+			}
+		}
+		"video" => {
+			if let Some(video) = feed_video(element, content_href) {
+				data.insert("preview".into(), json!({ "images": [{ "source": { "url": video["poster"], "width": video["width"], "height": video["height"] } }] }));
+				data.insert("secure_media".into(), json!({ "reddit_video": video }));
+			}
+		}
+		_ => {}
+	}
+
+	// Links, crossposts and media that couldn't be read show their thumbnail.
+	if let Some(thumbnail) = element.select(&FEED_THUMBNAIL).find_map(|image| image.value().attr("src")) {
+		let thumbnail_size = |name: &str| query_param(thumbnail, name).and_then(|size| size.parse::<i64>().ok()).unwrap_or(140);
+		data.insert("thumbnail".into(), thumbnail.into());
+		data.insert("thumbnail_width".into(), thumbnail_size("width").into());
+		data.insert("thumbnail_height".into(), thumbnail_size("height").into());
+	}
+	if post_type == "link" {
+		data.insert("url_overridden_by_dest".into(), content_href.into());
+	}
+
+	Some(json!({ "kind": "t3", "data": post }))
+}
+
+/// A video card's `reddit_video`, pointing at v.redd.it's largest video-only MP4.
+fn feed_video(element: ElementRef<'_>, content_href: &str) -> Option<Value> {
+	let player = element.select(&PLAYER).next()?;
+	let asset = content_href
+		.strip_prefix("https://v.redd.it/")
+		.map(|asset| asset.trim_end_matches('/'))
+		.filter(|asset| !asset.is_empty() && asset.chars().all(|c| c.is_ascii_alphanumeric()))
+		.or_else(|| hls_asset(player.value().attr("src")?))?;
+
+	// The player lists the sizes it can play; CMAF_<height>.mp4 exists for each.
+	let packaged: Value = serde_json::from_str(player.value().attr("packaged-media-json").unwrap_or_default()).unwrap_or_default();
+	let (width, height) = packaged["playbackMp4s"]["permutations"]
+		.as_array()
+		.into_iter()
+		.flatten()
+		.filter_map(|permutation| {
+			let dimensions = &permutation["source"]["dimensions"];
+			Some((dimensions["width"].as_i64()?, dimensions["height"].as_i64()?))
+		})
+		.max_by_key(|&(_, height)| height)
+		.unwrap_or((0, 480));
+
+	Some(json!({
+		"fallback_url": format!("https://v.redd.it/{asset}/CMAF_{height}.mp4"),
+		"hls_url": format!("https://v.redd.it/{asset}/HLSPlaylist.m3u8"),
+		"has_audio": false,
+		"is_gif": player.value().attr("gif").is_some(),
+		"width": width,
+		"height": height,
+		"poster": player.value().attr("poster").unwrap_or_default(),
+	}))
 }
 
 // WIKI
@@ -1257,6 +1459,76 @@ mod tests {
 		for sub in ["../comments", "a/b", "a?b", "r%2F"] {
 			assert!(search_path(Some(sub), "q", "", "", None).is_err(), "{sub}");
 		}
+	}
+
+	#[test]
+	fn test_parse_feed_fragment() {
+		let html = r#"
+<shreddit-post id="t3_text" permalink="/r/rust/comments/text/title/" content-href="https://www.reddit.com/r/rust/comments/text/title/" post-type="text" post-title="A &amp; B" author="alice" subreddit-prefixed-name="r/rust" domain="self.rust" score="12" upvote-ratio="0.9" comment-count="3" created-timestamp="2026-11-27T17:24:59.648000+0000" stickied>
+  <shreddit-post-flair slot="post-flair"><a><span style="background-color: #646D73;"><div class="flair-content"> Discussion </div></span></a></shreddit-post-flair>
+  <shreddit-post-text-body slot="text-body"><a><div><div id="t3_text-post-rtjson-content" class="md feed-card-text-preview" property="schema:articleBody"><p>Body with <search-telemetry-tracker><a href="/search/?q=x&amp;cId=1">term<span><svg></svg></span></a></search-telemetry-tracker></p></div></div></a></shreddit-post-text-body>
+</shreddit-post>
+<shreddit-ad-post id="t3_ad" permalink="/r/ad/" post-type="link"></shreddit-ad-post>
+<shreddit-post id="t3_image" permalink="/r/rust/comments/image/t/" content-href="https://i.redd.it/full.jpeg" post-type="image" post-title="Pic" author="bob" subreddit-prefixed-name="r/rust" domain="i.redd.it" score="5" is-author-deleted nsfw>
+  <img data-post-media-primary width="640" height="373" src="https://preview.redd.it/x-v0-full.jpeg?width=640&amp;s=a">
+</shreddit-post>
+<shreddit-post id="t3_video" permalink="/r/rust/comments/video/t/" content-href="https://v.redd.it/vid123" post-type="video" post-title="Vid" author="carol" domain="v.redd.it">
+  <shreddit-player src="https://v.redd.it/vid123/HLSPlaylist.m3u8?a=1" poster="https://external-preview.redd.it/p.png?s=1" packaged-media-json="{&quot;playbackMp4s&quot;:{&quot;permutations&quot;:[{&quot;source&quot;:{&quot;dimensions&quot;:{&quot;height&quot;:220,&quot;width&quot;:392}}},{&quot;source&quot;:{&quot;dimensions&quot;:{&quot;height&quot;:720,&quot;width&quot;:1280}}}]}}"></shreddit-player>
+</shreddit-post>
+<shreddit-post id="t3_gallery" permalink="/r/rust/comments/gallery/t/" content-href="https://www.reddit.com/gallery/gallery" post-type="gallery" post-title="Gal" author="dan" domain="reddit.com">
+  <gallery-carousel><ul>
+    <li slot="page-0"><img width="1920" height="1132" src="https://preview.redd.it/a.jpeg?width=640"><img src="https://i.redd.it/a.jpeg"></li>
+    <li slot="page-1"><img width="1920" height="1138" data-lazy-src="https://preview.redd.it/b.jpeg?width=640"><img src="https://i.redd.it/b.jpeg"></li>
+  </ul></gallery-carousel>
+</shreddit-post>
+<shreddit-post id="t3_link" permalink="/r/rust/comments/link/t/" content-href="https://example.com/article" post-type="link" post-title="Link" author="erin" domain="example.com">
+  <img src="https://styles.redditmedia.com/avatar.png"><img src="https://external-preview.redd.it/t.jpeg?width=140&amp;height=73&amp;s=1">
+</shreddit-post>
+<faceplate-partial loading="lazy" src="/svc/shreddit/community-more-posts/new/?after=dDNfbGluaw%3D%3D&amp;name=rust"></faceplate-partial>"#;
+		let listing = parse_feed_fragment(html);
+		assert_eq!(listing["data"]["after"], "t3_link");
+		let posts: Vec<&Value> = listing["data"]["children"].as_array().unwrap().iter().map(|post| &post["data"]).collect();
+		assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["text", "image", "video", "gallery", "link"]);
+
+		let text = posts[0];
+		assert_eq!(text["title"], "A & B");
+		assert_eq!(text["subreddit"], "rust");
+		assert_eq!(text["is_self"], true);
+		assert_eq!(text["url"], "/r/rust/comments/text/title/");
+		assert_eq!(text["stickied"], true);
+		assert_eq!(text["score"], 12);
+		assert_eq!(text["num_comments"], 3);
+		assert_eq!(text["link_flair_text"], "Discussion");
+		assert_eq!(text["link_flair_background_color"], "#646D73");
+		assert!(text["created_utc"].as_f64().unwrap() > 1.7e9);
+		let body = text["selftext_html"].as_str().unwrap();
+		assert!(body.contains("Body with </a>term</p>") && !body.contains("/search/"), "{body}");
+
+		let image = posts[1];
+		assert_eq!(image["author"], "[deleted]");
+		assert_eq!(image["over_18"], true);
+		assert_eq!(image["post_hint"], "image");
+		assert_eq!(image["url"], "https://i.redd.it/full.jpeg");
+		assert_eq!(image["preview"]["images"][0]["source"], json!({ "url": "https://i.redd.it/full.jpeg", "width": 640, "height": 373 }));
+
+		let video = &posts[2]["secure_media"]["reddit_video"];
+		assert_eq!(video["fallback_url"], "https://v.redd.it/vid123/CMAF_720.mp4");
+		assert_eq!(video["hls_url"], "https://v.redd.it/vid123/HLSPlaylist.m3u8");
+		assert_eq!(posts[2]["preview"]["images"][0]["source"]["url"], "https://external-preview.redd.it/p.png?s=1");
+
+		let gallery = posts[3];
+		assert_eq!(gallery["is_gallery"], true);
+		assert_eq!(gallery["gallery_data"]["items"], json!([{ "media_id": "i0" }, { "media_id": "i1" }]));
+		assert_eq!(gallery["media_metadata"]["i1"]["s"], json!({ "u": "https://i.redd.it/b.jpeg", "x": 1920, "y": 1138 }));
+
+		let link = posts[4];
+		assert_eq!(link["is_self"], false);
+		assert_eq!(link["url"], "https://example.com/article");
+		assert_eq!(link["url_overridden_by_dest"], "https://example.com/article");
+		assert_eq!(link["thumbnail"], "https://external-preview.redd.it/t.jpeg?width=140&height=73&s=1");
+		assert_eq!((link["thumbnail_width"].as_i64(), link["thumbnail_height"].as_i64()), (Some(140), Some(73)));
+
+		assert_eq!(parse_feed_fragment("<div>No posts</div>")["data"], json!({ "after": "", "children": [] }));
 	}
 
 	#[test]
