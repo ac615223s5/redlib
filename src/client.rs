@@ -448,19 +448,24 @@ async fn shreddit_send(path: &str, cursor: Option<&str>, referer: Option<&str>) 
 	let url = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
 
 	let mut builder = match cursor {
-		// Reddit's edge blocks POSTs that lack the Origin and Referer a browser sends.
 		Some(cursor) => SHREDDIT_CLIENT
 			.post(&url)
 			.header(wreq_header::CONTENT_TYPE, "application/x-www-form-urlencoded")
 			.header(wreq_header::ORIGIN, ALTERNATIVE_REDDIT_URL_BASE)
-			.header(wreq_header::REFERER, format!("{ALTERNATIVE_REDDIT_URL_BASE}/"))
-			.header("sec-fetch-site", "same-origin")
-			.header("sec-fetch-mode", "cors")
-			.header("sec-fetch-dest", "empty")
 			.body(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish()),
 		None => SHREDDIT_CLIENT.get(&url),
 	};
-	if let Some(referer) = referer {
+	// Reddit's edge blocks fragment requests that don't look like a page's
+	// fetch(): POSTs without the Origin and Referer a browser sends and, since
+	// 2026-11-28, GETs whose fetch metadata says they are a page navigation
+	// (the emulated browser's default). Both get a "blocked by network security" 403.
+	if path.starts_with(SHREDDIT_PATH_PREFIX) {
+		builder = builder
+			.header(wreq_header::REFERER, format!("{ALTERNATIVE_REDDIT_URL_BASE}/"))
+			.header("sec-fetch-site", "same-origin")
+			.header("sec-fetch-mode", "cors")
+			.header("sec-fetch-dest", "empty");
+	} else if let Some(referer) = referer {
 		builder = builder.header(wreq_header::REFERER, referer);
 	}
 
